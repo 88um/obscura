@@ -3,15 +3,19 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use deno_core::op2;
-use deno_core::OpState;
-use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use deno_core::op2;
+use deno_core::Extension;
+use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_net::{CookieJar, ObscuraHttpClient};
 use tokio::sync::Mutex;
 
-pub type InterceptCallback = Arc<Mutex<Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>>>;
+pub type InterceptCallback = Arc<
+    Mutex<
+        Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>,
+    >,
+>;
 
 #[derive(Debug)]
 pub enum InterceptResolution {
@@ -26,10 +30,14 @@ pub enum InterceptResolution {
         headers: HashMap<String, String>,
         body: String,
     },
-    Fail { reason: String },
+    Fail {
+        reason: String,
+    },
 }
 
 pub struct InterceptedRequest {
+    pub page_id: Option<String>,
+    pub page_url: String,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -37,10 +45,19 @@ pub struct InterceptedRequest {
     pub body: String,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
+    pub response_rx: tokio::sync::oneshot::Receiver<InterceptedResponse>,
+}
+
+pub struct InterceptedResponse {
+    pub url: String,
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub encoded_data_length: usize,
 }
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    pub page_id: Option<String>,
     pub url: String,
     pub title: String,
     pub blocked_urls: Vec<String>,
@@ -56,6 +73,7 @@ impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
             dom: None,
+            page_id: None,
             url: "about:blank".to_string(),
             title: String::new(),
             blocked_urls: Vec::new(),
@@ -73,7 +91,12 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 #[op2]
 #[string]
-fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[string] arg2: String) -> String {
+fn op_dom(
+    state: &OpState,
+    #[string] cmd: String,
+    #[string] arg1: String,
+    #[string] arg2: String,
+) -> String {
     let gs = state.borrow::<SharedState>().clone();
     let gs = gs.borrow();
     let dom = match &gs.dom {
@@ -88,7 +111,10 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
-                    if n.as_element().map(|name| name.local.as_ref() == "html").unwrap_or(false) {
+                    if n.as_element()
+                        .map(|name| name.local.as_ref() == "html")
+                        .unwrap_or(false)
+                    {
                         return cid.index().to_string();
                     }
                 }
@@ -98,43 +124,69 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "document_doctype" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
-                    if let obscura_dom::NodeData::Doctype { name, public_id, system_id } = &n.data {
+                    if let obscura_dom::NodeData::Doctype {
+                        name,
+                        public_id,
+                        system_id,
+                    } = &n.data
+                    {
                         return serde_json::json!({
                             "name": name,
                             "publicId": public_id,
                             "systemId": system_id,
                             "nodeId": cid.index(),
-                        }).to_string();
+                        })
+                        .to_string();
                     }
                 }
             }
             "null".into()
         }
-        "get_element_by_id" => {
-            dom.get_element_by_id(&arg1).map(|id| id.index().to_string()).unwrap_or("-1".into())
-        }
-        "query_selector" => {
-            dom.query_selector(&arg1).ok().flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
-        }
+        "get_element_by_id" => dom
+            .get_element_by_id(&arg1)
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into()),
+        "query_selector" => dom
+            .query_selector(&arg1)
+            .ok()
+            .flatten()
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into()),
         "query_selector_all" => {
-            let ids: Vec<i32> = dom.query_selector_all(&arg1).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            let ids: Vec<i32> = dom
+                .query_selector_all(&arg1)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
+                .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
-                NodeData::Document => "9", NodeData::Element { .. } => "1", NodeData::Text { .. } => "3",
-                NodeData::Comment { .. } => "8", NodeData::Doctype { .. } => "10", NodeData::ProcessingInstruction { .. } => "7",
-            }).unwrap_or("0").into()
+            dom.get_node(NodeId::new(nid))
+                .map(|n| match &n.data {
+                    NodeData::Document => "9",
+                    NodeData::Element { .. } => "1",
+                    NodeData::Text { .. } => "3",
+                    NodeData::Comment { .. } => "8",
+                    NodeData::Doctype { .. } => "10",
+                    NodeData::ProcessingInstruction { .. } => "7",
+                })
+                .unwrap_or("0")
+                .into()
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
-                NodeData::Document => "#document".to_string(), NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
-                NodeData::Text { .. } => "#text".to_string(), NodeData::Comment { .. } => "#comment".to_string(),
-                NodeData::Doctype { name, .. } => name.clone(), NodeData::ProcessingInstruction { target, .. } => target.clone(),
-            }).unwrap_or_default();
+            let name: String = dom
+                .get_node(NodeId::new(nid))
+                .map(|n| match &n.data {
+                    NodeData::Document => "#document".to_string(),
+                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                    NodeData::Text { .. } => "#text".to_string(),
+                    NodeData::Comment { .. } => "#comment".to_string(),
+                    NodeData::Doctype { name, .. } => name.clone(),
+                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
+                })
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "text_content" => {
@@ -143,25 +195,43 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).and_then(|n| match cmd.as_str() {
-                "parent_node" => n.parent, "first_child" => n.first_child,
-                "last_child" => n.last_child, "next_sibling" => n.next_sibling,
-                "prev_sibling" => n.prev_sibling, _ => None,
-            }).map(|id| id.index().to_string()).unwrap_or("-1".into())
+            dom.get_node(NodeId::new(nid))
+                .and_then(|n| match cmd.as_str() {
+                    "parent_node" => n.parent,
+                    "first_child" => n.first_child,
+                    "last_child" => n.last_child,
+                    "next_sibling" => n.next_sibling,
+                    "prev_sibling" => n.prev_sibling,
+                    _ => None,
+                })
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
         }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();
+            let ids: Vec<i32> = dom
+                .children(NodeId::new(nid))
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom.get_node(NodeId::new(nid)).and_then(|n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).unwrap_or_default();
+            let name = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| {
+                    n.as_element()
+                        .map(|name| name.local.as_ref().to_ascii_uppercase())
+                })
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
+            let val = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
             serde_json::to_string(&val).unwrap_or("null".into())
         }
         "set_attribute" => {
@@ -169,7 +239,9 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
                 if name == "id" {
-                    let old_id = dom.get_node(node_id).and_then(|n| n.get_attribute("id").map(|s| s.to_string()));
+                    let old_id = dom
+                        .get_node(node_id)
+                        .and_then(|n| n.get_attribute("id").map(|s| s.to_string()));
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                     dom.update_id_index(node_id, old_id.as_deref(), Some(value));
                 } else {
@@ -228,45 +300,66 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
-                match &mut n.data {
-                    NodeData::Text { contents } => { *contents = arg2.clone(); }
-                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
-                    _ => {}
+            dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {
+                NodeData::Text { contents } => {
+                    *contents = arg2.clone();
                 }
+                NodeData::Comment { contents } => {
+                    *contents = arg2.clone();
+                }
+                _ => {}
             });
             "true".into()
         }
-        "create_document_fragment" => {
-            dom.new_node(NodeData::Document).index().to_string()
-        }
-        "create_element" => {
-            dom.new_node(NodeData::Element {
-                name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(arg1.as_str())),
-                attrs: vec![], template_contents: None, mathml_annotation_xml_integration_point: false,
-            }).index().to_string()
-        }
-        "create_text_node" => {
-            dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
-        }
-        "create_comment_node" => {
-            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
-        }
+        "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
+        "create_element" => dom
+            .new_node(NodeData::Element {
+                name: html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from(arg1.as_str()),
+                ),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+            .index()
+            .to_string(),
+        "create_text_node" => dom
+            .new_node(NodeData::Text {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
+        "create_comment_node" => dom
+            .new_node(NodeData::Comment {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter()
+            let ids: Vec<i32> = dom
+                .children(NodeId::new(nid))
+                .iter()
                 .filter(|&&id| dom.get_node(id).map(|n| n.is_element()).unwrap_or(false))
-                .map(|id| id.index() as i32).collect();
+                .map(|id| id.index() as i32)
+                .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "has_child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).map(|n| n.first_child.is_some()).unwrap_or(false).to_string()
+            dom.get_node(NodeId::new(nid))
+                .map(|n| n.first_child.is_some())
+                .unwrap_or(false)
+                .to_string()
         }
         "contains" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let other = arg2.parse::<u32>().unwrap_or(0);
-            dom.descendants(NodeId::new(nid)).contains(&NodeId::new(other)).to_string()
+            dom.descendants(NodeId::new(nid))
+                .contains(&NodeId::new(other))
+                .to_string()
         }
         _ => "null".into(),
     }
@@ -303,7 +396,11 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
+    tracing::debug!(
+        "op_fetch_url called: {} {} (intercept check pending)",
+        method,
+        url
+    );
 
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url) {
@@ -314,11 +411,12 @@ async fn op_fetch_url(
                 "headers": {},
                 "blocked": true,
                 "error": e,
-            }).to_string());
+            })
+            .to_string());
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, http_client, page_url) = {
+    let (cookie_jar, in_flight, intercept_tx, http_client, page_url, page_id) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -330,29 +428,49 @@ async fn op_fetch_url(
                     "url": url,
                     "headers": {},
                     "blocked": true,
-                }).to_string());
+                })
+                .to_string());
             }
         }
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         let http_client = gs.http_client.clone();
         let page_url = gs.url.clone();
-        tracing::debug!("op_fetch_url: intercept_enabled={}, has_tx={}", gs.intercept_enabled, gs.intercept_tx.is_some());
+        let page_id = gs.page_id.clone();
+        tracing::debug!(
+            "op_fetch_url: intercept_enabled={}, has_tx={}",
+            gs.intercept_enabled,
+            gs.intercept_tx.is_some()
+        );
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
-            gs.intercept_tx.clone().map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+            let request_prefix = page_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .unwrap_or("intercept");
+            gs.intercept_tx.clone().map(|tx| {
+                (
+                    tx,
+                    format!("{}-intercept-{}", request_prefix, gs.intercept_counter),
+                )
+            })
         } else {
             None
         };
-        (jar, in_flight, itx, http_client, page_url)
+        (jar, in_flight, itx, http_client, page_url, page_id)
     };
 
-    let mut custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+    let mut custom_headers: HashMap<String, String> =
+        serde_json::from_str(&headers_json).unwrap_or_default();
     apply_browser_fetch_headers(&mut custom_headers, &url, &page_url, http_client.as_ref()).await;
 
+    let mut response_tx = None;
     if let Some((tx, request_id)) = intercept_tx {
         let (resolve_tx, mut resolve_rx) = tokio::sync::oneshot::channel();
+        let (completion_tx, response_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            page_id: page_id.clone(),
+            page_url: page_url.clone(),
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
@@ -360,17 +478,24 @@ async fn op_fetch_url(
             body: body.clone(),
             resource_type: "Fetch".to_string(),
             resolver: resolve_tx,
+            response_rx,
         };
         if tx.send(intercepted).is_ok() {
+            response_tx = Some(completion_tx);
             match resolve_rx.try_recv() {
-                Ok(InterceptResolution::Fulfill { status, headers: h, body: b }) => {
+                Ok(InterceptResolution::Fulfill {
+                    status,
+                    headers: h,
+                    body: b,
+                }) => {
                     let resp_headers: HashMap<String, String> = h;
                     return Ok(serde_json::json!({
                         "status": status,
                         "body": b,
                         "url": url,
                         "headers": resp_headers,
-                    }).to_string());
+                    })
+                    .to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -380,16 +505,19 @@ async fn op_fetch_url(
                         "headers": {},
                         "blocked": true,
                         "error": reason,
-                    }).to_string());
+                    })
+                    .to_string());
                 }
                 Ok(InterceptResolution::Continue { .. }) => {
                     tracing::debug!("Interception: continue request {}", url);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    tracing::debug!("Interception event emitted; continuing request without blocking {}", url);
+                    tracing::debug!(
+                        "Interception event emitted; continuing request without blocking {}",
+                        url
+                    );
                 }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
             }
         }
     }
@@ -406,7 +534,11 @@ async fn op_fetch_url(
             }
         })
         .unwrap_or_default();
-    let page_origin = if origin.is_empty() { request_origin.clone() } else { origin.clone() };
+    let page_origin = if origin.is_empty() {
+        request_origin.clone()
+    } else {
+        origin.clone()
+    };
     let is_cross_origin = !page_origin.is_empty() && request_origin != page_origin;
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
@@ -416,9 +548,9 @@ async fn op_fetch_url(
         && (req_method != reqwest::Method::GET
             && req_method != reqwest::Method::HEAD
             && req_method != reqwest::Method::POST
-            || custom_headers.keys().any(|k| {
-                !is_cors_safelisted_or_browser_header(k)
-            }));
+            || custom_headers
+                .keys()
+                .any(|k| !is_cors_safelisted_or_browser_header(k)));
 
     if needs_preflight {
         let preflight = client
@@ -427,11 +559,17 @@ async fn op_fetch_url(
             .header("Access-Control-Request-Method", method.as_str())
             .header(
                 "Access-Control-Request-Headers",
-                custom_headers.keys().cloned().collect::<Vec<_>>().join(", "),
+                custom_headers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )
             .send()
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+            .map_err(|e| {
+                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
+            })?;
 
         let allowed_origin = preflight
             .headers()
@@ -476,15 +614,12 @@ async fn op_fetch_url(
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| {
-            if let Some(ref counter) = in_flight {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            deno_error::JsErrorBox::generic(e.to_string())
-        })?;
+    let response = req.send().await.map_err(|e| {
+        if let Some(ref counter) = in_flight {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        deno_error::JsErrorBox::generic(e.to_string())
+    })?;
 
     if let Some(ref counter) = in_flight {
         counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -534,7 +669,21 @@ async fn op_fetch_url(
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
 
-    tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
+    if let Some(tx) = response_tx {
+        let _ = tx.send(InterceptedResponse {
+            url: url.clone(),
+            status,
+            headers: resp_headers.clone(),
+            encoded_data_length: resp_bytes.len(),
+        });
+    }
+
+    tracing::debug!(
+        "op_fetch_url completed: {} {} ({} bytes)",
+        method,
+        url,
+        resp_body.len()
+    );
 
     Ok(serde_json::json!({
         "status": status,
@@ -552,21 +701,39 @@ async fn apply_browser_fetch_headers(
     page_url: &str,
     http_client: Option<&Arc<ObscuraHttpClient>>,
 ) {
-    let ua = if let Some(client) = http_client {
-        client.user_agent.read().await.clone()
+    let (ua, extra_headers) = if let Some(client) = http_client {
+        (
+            client.user_agent.read().await.clone(),
+            client.extra_headers.read().await.clone(),
+        )
     } else {
-        obscura_net::DEFAULT_USER_AGENT.to_string()
+        (obscura_net::DEFAULT_USER_AGENT.to_string(), HashMap::new())
     };
+    let accept_language = header_value_case_insensitive(&extra_headers, "accept-language")
+        .unwrap_or_else(|| "en-US,en;q=0.9".to_string());
+    let sec_ch_platform = header_value_case_insensitive(&extra_headers, "sec-ch-ua-platform")
+        .unwrap_or_else(|| obscura_net::DEFAULT_SEC_CH_UA_PLATFORM.to_string());
+    let sec_ch_platform_version =
+        header_value_case_insensitive(&extra_headers, "sec-ch-ua-platform-version")
+            .unwrap_or_else(|| obscura_net::DEFAULT_SEC_CH_UA_PLATFORM_VERSION.to_string());
 
     insert_header_if_absent(headers, "user-agent", ua);
     insert_header_if_absent(headers, "accept", "*/*");
-    insert_header_if_absent(headers, "accept-language", "en-US,en;q=0.9");
+    insert_header_if_absent(headers, "accept-language", accept_language);
     insert_header_if_absent(headers, "sec-ch-ua", obscura_net::DEFAULT_SEC_CH_UA);
-    insert_header_if_absent(headers, "sec-ch-ua-full-version-list", obscura_net::DEFAULT_SEC_CH_UA_FULL_VERSION_LIST);
+    insert_header_if_absent(
+        headers,
+        "sec-ch-ua-full-version-list",
+        obscura_net::DEFAULT_SEC_CH_UA_FULL_VERSION_LIST,
+    );
     insert_header_if_absent(headers, "sec-ch-ua-model", "\"\"");
     insert_header_if_absent(headers, "sec-ch-ua-mobile", "?0");
-    insert_header_if_absent(headers, "sec-ch-ua-platform", obscura_net::DEFAULT_SEC_CH_UA_PLATFORM);
-    insert_header_if_absent(headers, "sec-ch-ua-platform-version", obscura_net::DEFAULT_SEC_CH_UA_PLATFORM_VERSION);
+    insert_header_if_absent(headers, "sec-ch-ua-platform", sec_ch_platform);
+    insert_header_if_absent(
+        headers,
+        "sec-ch-ua-platform-version",
+        sec_ch_platform_version,
+    );
     insert_header_if_absent(headers, "sec-ch-prefers-color-scheme", "dark");
     insert_header_if_absent(headers, "sec-fetch-dest", "empty");
     insert_header_if_absent(headers, "sec-fetch-mode", "cors");
@@ -583,8 +750,22 @@ async fn apply_browser_fetch_headers(
     }
 }
 
-fn insert_header_if_absent(headers: &mut HashMap<String, String>, key: &str, value: impl Into<String>) {
-    if !headers.keys().any(|existing| existing.eq_ignore_ascii_case(key)) {
+fn header_value_case_insensitive(headers: &HashMap<String, String>, key: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.clone())
+}
+
+fn insert_header_if_absent(
+    headers: &mut HashMap<String, String>,
+    key: &str,
+    value: impl Into<String>,
+) {
+    if !headers
+        .keys()
+        .any(|existing| existing.eq_ignore_ascii_case(key))
+    {
         headers.insert(key.to_string(), value.into());
     }
 }

@@ -24,7 +24,10 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
+            let ua = params
+                .get("userAgent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.http_client.set_user_agent(ua).await;
                 if let Some(js) = &mut page.js {
@@ -36,37 +39,34 @@ pub async fn handle(
         "getCookies" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let cookies = page.context.cookie_jar.get_all_cookies();
-            let cdp_cookies: Vec<Value> = cookies.iter().map(|c| {
-                json!({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain,
-                    "path": c.path,
-                    "expires": -1,
-                    "size": c.name.len() + c.value.len(),
-                    "httpOnly": c.http_only,
-                    "secure": c.secure,
-                    "session": true,
-                    "sameParty": false,
-                    "sourceScheme": "Secure",
-                    "sourcePort": 443,
+            let cdp_cookies: Vec<Value> = cookies
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name,
+                        "value": c.value,
+                        "domain": c.domain,
+                        "path": c.path,
+                        "expires": -1,
+                        "size": c.name.len() + c.value.len(),
+                        "httpOnly": c.http_only,
+                        "secure": c.secure,
+                        "session": true,
+                        "sameParty": false,
+                        "sourceScheme": "Secure",
+                        "sourcePort": 443,
+                    })
                 })
-            }).collect();
+                .collect();
             Ok(json!({ "cookies": cdp_cookies }))
         }
         "setCookies" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
-                let cookie_infos: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
-                    Some(obscura_net::CookieInfo {
-                        name: c.get("name")?.as_str()?.to_string(),
-                        value: c.get("value")?.as_str()?.to_string(),
-                        domain: c.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        path: c.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string(),
-                        secure: c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false),
-                        http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
-                    })
-                }).collect();
+                let cookie_infos: Vec<obscura_net::CookieInfo> = cookies
+                    .iter()
+                    .filter_map(cdp_cookie_to_cookie_info)
+                    .collect();
                 page.context.cookie_jar.set_cookies_from_cdp(cookie_infos);
             }
             Ok(json!({}))
@@ -80,5 +80,91 @@ pub async fn handle(
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
         _ => Err(format!("Unknown Network method: {}", method)),
+    }
+}
+
+fn cdp_cookie_to_cookie_info(c: &Value) -> Option<obscura_net::CookieInfo> {
+    let name = c.get("name")?.as_str()?.to_string();
+    let value = c.get("value")?.as_str()?.to_string();
+    let mut domain = c
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let mut path = c
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let mut secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if domain.is_empty() {
+        let url = c.get("url").and_then(|v| v.as_str())?;
+        let parsed = url::Url::parse(url).ok()?;
+        domain = parsed.host_str()?.to_ascii_lowercase();
+        if c.get("path").is_none() {
+            path = default_cookie_path(parsed.path());
+        }
+        secure = secure || parsed.scheme() == "https";
+    }
+
+    if domain.is_empty() {
+        return None;
+    }
+
+    Some(obscura_net::CookieInfo {
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+fn default_cookie_path(url_path: &str) -> String {
+    if !url_path.starts_with('/') || url_path == "/" {
+        return "/".to_string();
+    }
+    match url_path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => url_path[..index].to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_cookies_accepts_cdp_cookie_with_url_only() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert("session-1".to_string(), page_id);
+
+        handle(
+            "setCookies",
+            &json!({
+                "cookies": [{
+                    "name": "sessionid",
+                    "value": "abc",
+                    "url": "https://www.instagram.com/annaSihombing96067/",
+                    "path": "/",
+                    "secure": true,
+                    "httpOnly": true
+                }]
+            }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("Network.setCookies should accept url-scoped cookies");
+
+        let page = ctx.get_session_page(&session_id).unwrap();
+        let url = url::Url::parse("https://www.instagram.com/graphql/query/").unwrap();
+        let header = page.context.cookie_jar.get_cookie_header(&url);
+        assert!(header.contains("sessionid=abc"));
     }
 }

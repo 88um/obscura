@@ -77,8 +77,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 if !(200..300).contains(&resp.status) {
                     return Err(io_err(format!(
                         "Module {} returned HTTP {}",
-                        url,
-                        resp.status
+                        url, resp.status
                     )));
                 }
 
@@ -103,9 +102,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                     )));
                 }
 
-                resp.text().await.map_err(|e| {
-                    io_err(format!("Failed to read module body {}: {}", url, e))
-                })?
+                resp.text()
+                    .await
+                    .map_err(|e| io_err(format!("Failed to read module body {}: {}", url, e)))?
             };
 
             let specifier = ModuleSpecifier::parse(&url)

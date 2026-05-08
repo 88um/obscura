@@ -37,11 +37,102 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "setTouchEmulationEnabled" | "setEmulatedMedia" | "setTimezoneOverride"
-        | "setLocaleOverride" | "setCPUThrottlingRate" | "setScriptExecutionDisabled"
-        | "setFocusEmulationEnabled" | "setScrollbarsHidden" | "setDefaultBackgroundColorOverride" => {
+        "setUserAgentOverride" => {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                if let Some(ua) = params.get("userAgent").and_then(|v| v.as_str()) {
+                    page.http_client.set_user_agent(ua).await;
+                }
+
+                if let Some(accept_language) = params.get("acceptLanguage").and_then(|v| v.as_str())
+                {
+                    let mut headers = page.http_client.extra_headers.write().await;
+                    headers.insert("accept-language".to_string(), accept_language.to_string());
+                }
+
+                if let Some(metadata) = params.get("userAgentMetadata").and_then(|v| v.as_object())
+                {
+                    if let Some(platform) = metadata.get("platform").and_then(|v| v.as_str()) {
+                        let mut headers = page.http_client.extra_headers.write().await;
+                        headers.insert(
+                            "sec-ch-ua-platform".to_string(),
+                            format!("\"{}\"", platform),
+                        );
+                    }
+                    if let Some(platform_version) =
+                        metadata.get("platformVersion").and_then(|v| v.as_str())
+                    {
+                        let mut headers = page.http_client.extra_headers.write().await;
+                        headers.insert(
+                            "sec-ch-ua-platform-version".to_string(),
+                            format!("\"{}\"", platform_version),
+                        );
+                    }
+                }
+
+                page.set_user_agent_override(params.clone());
+            }
+
             Ok(json!({}))
         }
+        "setTouchEmulationEnabled"
+        | "setEmulatedMedia"
+        | "setTimezoneOverride"
+        | "setLocaleOverride"
+        | "setCPUThrottlingRate"
+        | "setScriptExecutionDisabled"
+        | "setFocusEmulationEnabled"
+        | "setScrollbarsHidden"
+        | "setDefaultBackgroundColorOverride" => Ok(json!({})),
         _ => Err(format!("Unknown Emulation method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_user_agent_override_accepts_playwright_context_params() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert("session-1".to_string(), page_id);
+
+        let result = handle(
+            "setUserAgentOverride",
+            &json!({
+                "userAgent": "Playwright-Test-UA/1.0",
+                "acceptLanguage": "en-US",
+                "platform": "MacIntel",
+                "userAgentMetadata": {
+                    "platform": "macOS",
+                    "platformVersion": "14.0.0"
+                }
+            }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("setUserAgentOverride should be accepted");
+
+        assert_eq!(result, json!({}));
+
+        let page = ctx
+            .get_session_page(&session_id)
+            .expect("session should still point at the page");
+        assert_eq!(
+            page.http_client.user_agent.read().await.as_str(),
+            "Playwright-Test-UA/1.0"
+        );
+        let headers = page.http_client.extra_headers.read().await;
+        assert_eq!(
+            headers.get("accept-language").map(String::as_str),
+            Some("en-US")
+        );
+        assert_eq!(
+            headers.get("sec-ch-ua-platform").map(String::as_str),
+            Some("\"macOS\"")
+        );
+        assert!(page.user_agent_override.is_some());
     }
 }

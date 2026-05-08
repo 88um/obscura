@@ -953,18 +953,11 @@ class Element extends Node {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
-      _registerIframe(el);
-      if (typeof el.onload === 'function') {
-        try { el.onload(); } catch(e) {}
-      } else {
-        var onloadAttr = el.getAttribute('onload');
-        if (onloadAttr) try { (0, eval)(onloadAttr); } catch(e) {}
-      }
+      _finishIframeLoad(el, fullUrl);
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      _registerIframe(el);
-      if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
+      _finishIframeLoad(el, fullUrl);
     });
   }
   get contentDocument() {
@@ -1694,6 +1687,23 @@ function _registerIframe(iframeEl) {
     enumerable: false,
   });
 }
+function _isFacebookInstagramSyncIframe(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin === "https://www.facebook.com" && parsed.pathname === "/instagram/login_sync/";
+  } catch (_) {
+    return false;
+  }
+}
+function _finishIframeLoad(iframeEl, url) {
+  _registerIframe(iframeEl);
+  _fireElementLoad(iframeEl);
+  if (_isFacebookInstagramSyncIframe(url) && iframeEl._iframeWin) {
+    setTimeout(() => {
+      iframeEl._iframeWin?._postMessageToParent?.({ eventName: "ig_iframe_ready" });
+    }, 0);
+  }
+}
 const _OBSCURA_DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const _OBSCURA_CH_BRANDS = [
   {brand: "Google Chrome", version: "147"},
@@ -1705,10 +1715,102 @@ const _OBSCURA_CH_FULL_VERSION_LIST = [
   {brand: "Not.A/Brand", version: "8.0.0.0"},
   {brand: "Chromium", version: "147.0.0.0"},
 ];
+globalThis.__obscura_language = globalThis.__obscura_language || "en-US";
+globalThis.__obscura_languages = globalThis.__obscura_languages || ["en-US","en"];
+globalThis.__obscura_platform = globalThis.__obscura_platform || "MacIntel";
+globalThis.__obscura_user_agent_metadata = globalThis.__obscura_user_agent_metadata || null;
+function _obscuraLangList(value) {
+  if (!value || typeof value !== "string") return ["en-US","en"];
+  return value.split(",").map(v => v.split(";")[0].trim()).filter(Boolean);
+}
+function _obscuraUAMetadata() {
+  return globalThis.__obscura_user_agent_metadata || {};
+}
+globalThis.__obscura_apply_user_agent_override = function(params) {
+  params = params || {};
+  if (typeof params.userAgent === "string") globalThis.__obscura_ua = params.userAgent;
+  if (typeof params.acceptLanguage === "string") {
+    globalThis.__obscura_language = params.acceptLanguage.split(",")[0].split(";")[0].trim() || "en-US";
+    globalThis.__obscura_languages = _obscuraLangList(params.acceptLanguage);
+  }
+  if (typeof params.platform === "string") globalThis.__obscura_platform = params.platform;
+  if (params.userAgentMetadata && typeof params.userAgentMetadata === "object") {
+    globalThis.__obscura_user_agent_metadata = params.userAgentMetadata;
+  }
+};
+class _ObscuraServiceWorker {
+  constructor(scriptURL = "") {
+    this.scriptURL = scriptURL;
+    this.state = "activated";
+    this.onstatechange = null;
+    this.onerror = null;
+  }
+  postMessage() {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+class _ObscuraPushManager {
+  getSubscription() { return Promise.resolve(null); }
+  permissionState() { return Promise.resolve("prompt"); }
+  subscribe() { return Promise.reject(new DOMException("NotAllowedError")); }
+}
+class _ObscuraNavigationPreloadManager {
+  enable() { return Promise.resolve(); }
+  disable() { return Promise.resolve(); }
+  getState() { return Promise.resolve({enabled: false, headerValue: "true"}); }
+  setHeaderValue() { return Promise.resolve(); }
+}
+class _ObscuraServiceWorkerRegistration {
+  constructor(scope = "/", scriptURL = "") {
+    this.scope = scope;
+    this.installing = null;
+    this.waiting = null;
+    this.active = new _ObscuraServiceWorker(scriptURL);
+    this.navigationPreload = new _ObscuraNavigationPreloadManager();
+    this.pushManager = new _ObscuraPushManager();
+    this.updateViaCache = "imports";
+    this.onupdatefound = null;
+  }
+  getNotifications() { return Promise.resolve([]); }
+  showNotification() { return Promise.resolve(); }
+  unregister() { return Promise.resolve(true); }
+  update() { return Promise.resolve(this); }
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+class _ObscuraServiceWorkerContainer {
+  constructor() {
+    this.controller = null;
+    this.oncontrollerchange = null;
+    this.onmessage = null;
+    this.onmessageerror = null;
+    this._registrations = [];
+    this.ready = Promise.resolve(new _ObscuraServiceWorkerRegistration("/", ""));
+  }
+  register(scriptURL = "", options = {}) {
+    const registration = new _ObscuraServiceWorkerRegistration(options.scope || "/", String(scriptURL || ""));
+    this._registrations.push(registration);
+    this.ready = Promise.resolve(registration);
+    return Promise.resolve(registration);
+  }
+  getRegistration() { return Promise.resolve(this._registrations[0] || null); }
+  getRegistrations() { return Promise.resolve(this._registrations.slice()); }
+  startMessages() {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+globalThis.ServiceWorker = globalThis.ServiceWorker || _ObscuraServiceWorker;
+globalThis.ServiceWorkerRegistration = globalThis.ServiceWorkerRegistration || _ObscuraServiceWorkerRegistration;
+globalThis.ServiceWorkerContainer = globalThis.ServiceWorkerContainer || _ObscuraServiceWorkerContainer;
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || _OBSCURA_DEFAULT_UA; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  language: "en-US", languages: ["en-US","en"], platform: "MacIntel",
+  get language() { return globalThis.__obscura_language || "en-US"; },
+  get languages() { return globalThis.__obscura_languages || ["en-US","en"]; },
+  get platform() { return globalThis.__obscura_platform || "MacIntel"; },
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
@@ -1740,25 +1842,26 @@ globalThis.navigator = {
     return m;
   },
   userAgentData: {
-    brands: _OBSCURA_CH_BRANDS,
-    mobile: false,
-    platform: "macOS",
+    get brands() { return Array.isArray(_obscuraUAMetadata().brands) ? _obscuraUAMetadata().brands : _OBSCURA_CH_BRANDS; },
+    get mobile() { return Boolean(_obscuraUAMetadata().mobile); },
+    get platform() { return typeof _obscuraUAMetadata().platform === "string" ? _obscuraUAMetadata().platform : "macOS"; },
     getHighEntropyValues(hints) {
+      const metadata = _obscuraUAMetadata();
       return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
-        brands: _OBSCURA_CH_BRANDS,
-        fullVersionList: _OBSCURA_CH_FULL_VERSION_LIST,
-        mobile: false,
-        model: "",
-        platform: "macOS",
-        platformVersion: "26.4.0",
-        uaFullVersion: "147.0.0.0",
+        architecture: metadata.architecture || "x86",
+        bitness: metadata.bitness || "64",
+        brands: Array.isArray(metadata.brands) ? metadata.brands : _OBSCURA_CH_BRANDS,
+        fullVersionList: Array.isArray(metadata.fullVersionList) ? metadata.fullVersionList : _OBSCURA_CH_FULL_VERSION_LIST,
+        mobile: Boolean(metadata.mobile),
+        model: metadata.model || "",
+        platform: metadata.platform || "macOS",
+        platformVersion: metadata.platformVersion || "26.4.0",
+        uaFullVersion: metadata.uaFullVersion || "147.0.0.0",
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null },
+  serviceWorker: new globalThis.ServiceWorkerContainer(),
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -3291,7 +3394,7 @@ class _IframeWindow {
     }
   }
 
-  postMessage(data, origin) {
+  _postMessageToParent(data) {
     const event = new MessageEvent('message', {
       data: data,
       origin: this.location.origin,
@@ -3300,6 +3403,16 @@ class _IframeWindow {
     Promise.resolve().then(() => {
       globalThis.dispatchEvent?.(event);
     });
+  }
+
+  postMessage(data, origin) {
+    if (this.location?.origin === "https://www.facebook.com" && data?.eventName === "ig_iframe_sync") {
+      Promise.resolve().then(() => {
+        this._postMessageToParent({ eventName: "ig_iframe_success" });
+      });
+      return;
+    }
+    this._postMessageToParent(data);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }

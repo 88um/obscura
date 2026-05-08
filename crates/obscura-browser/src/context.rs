@@ -40,16 +40,11 @@ impl BrowserContext {
         user_agent: Option<String>,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
-        let mut client = ObscuraHttpClient::with_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-        );
+        let mut client = ObscuraHttpClient::with_options(cookie_jar.clone(), proxy_url.as_deref());
         if stealth {
             client.block_trackers = true;
         }
-        let resolved_ua = user_agent.unwrap_or_else(|| {
-            obscura_net::DEFAULT_USER_AGENT.to_string()
-        });
+        let resolved_ua = user_agent.unwrap_or_else(|| obscura_net::DEFAULT_USER_AGENT.to_string());
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.
@@ -93,12 +88,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_full_options_falls_back_to_chrome_default() {
-        let ctx = BrowserContext::with_full_options(
-            "test".to_string(),
-            None,
-            false,
-            None,
-        );
+        let ctx = BrowserContext::with_full_options("test".to_string(), None, false, None);
         assert!(ctx.user_agent.contains("Chrome"));
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert!(client_ua.contains("Chrome"));

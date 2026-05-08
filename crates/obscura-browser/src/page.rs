@@ -40,6 +40,7 @@ pub struct Page {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub device_scale_factor: f64,
+    pub user_agent_override: Option<serde_json::Value>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
@@ -78,6 +79,7 @@ impl Page {
             viewport_width: 1920,
             viewport_height: 1000,
             device_scale_factor: 2.0,
+            user_agent_override: None,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
@@ -91,13 +93,21 @@ impl Page {
             return false;
         }
         for pattern in &self.intercept_block_patterns {
-            if pattern == "*" { return true; }
+            if pattern == "*" {
+                return true;
+            }
             if pattern.starts_with('*') && pattern.ends_with('*') {
-                if url.contains(&pattern[1..pattern.len()-1]) { return true; }
+                if url.contains(&pattern[1..pattern.len() - 1]) {
+                    return true;
+                }
             } else if pattern.starts_with('*') {
-                if url.ends_with(&pattern[1..]) { return true; }
+                if url.ends_with(&pattern[1..]) {
+                    return true;
+                }
             } else if pattern.ends_with('*') {
-                if url.starts_with(&pattern[..pattern.len()-1]) { return true; }
+                if url.starts_with(&pattern[..pattern.len() - 1]) {
+                    return true;
+                }
             } else if url.contains(pattern) {
                 return true;
             }
@@ -119,6 +129,7 @@ impl Page {
             let dom = self.dom.take();
 
             let js = self.js.as_mut().unwrap();
+            js.set_page_id(&self.id);
             js.set_url(&url_str);
             js.set_title(&title);
             if let Ok(ua) = self.http_client.user_agent.try_read() {
@@ -129,22 +140,28 @@ impl Page {
                 self.viewport_height,
                 self.device_scale_factor,
             );
+            if let Some(override_params) = &self.user_agent_override {
+                js.apply_user_agent_override(override_params);
+            }
 
             if let Some(d) = dom {
                 js.set_dom(d);
             }
 
-            let _ = js.execute_script("<reset>",
+            let _ = js.execute_script(
+                "<reset>",
                 "_cache.clear(); globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; \
                  _iframeRegistry.length = 0; globalThis.length = 0; \
                  globalThis._formValues = {}; globalThis._formChecked = {}; \
                  globalThis._eventRegistry = {}; \
-                 globalThis.document = new Document(+_dom('document_node_id'));");
+                 globalThis.document = new Document(+_dom('document_node_id'));",
+            );
 
             return;
         }
 
         let mut rt = ObscuraJsRuntime::with_base_url(&self.url_string());
+        rt.set_page_id(&self.id);
         rt.set_url(&self.url_string());
         rt.set_title(&self.title);
 
@@ -164,6 +181,9 @@ impl Page {
             self.viewport_height,
             self.device_scale_factor,
         );
+        if let Some(override_params) = &self.user_agent_override {
+            rt.apply_user_agent_override(override_params);
+        }
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
 
@@ -179,7 +199,10 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -192,8 +215,8 @@ impl Page {
         }
 
         let all_scripts = match &self.js {
-            Some(js) => {
-                js.with_dom(|dom| {
+            Some(js) => js
+                .with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
 
@@ -232,8 +255,8 @@ impl Page {
                         }
                     }
                     scripts
-                }).unwrap_or_default()
-            }
+                })
+                .unwrap_or_default(),
             None => return,
         };
 
@@ -259,15 +282,22 @@ impl Page {
 
         let scripts = regular;
 
-        tracing::info!("Found {} regular + {} deferred + {} async scripts", scripts.len(), deferred.len(), async_scripts.len());
-        let all_to_execute: Vec<ScriptInfo> = scripts.into_iter()
+        tracing::info!(
+            "Found {} regular + {} deferred + {} async scripts",
+            scripts.len(),
+            deferred.len(),
+            async_scripts.len()
+        );
+        let all_to_execute: Vec<ScriptInfo> = scripts
+            .into_iter()
             .chain(deferred.into_iter())
             .chain(async_scripts.into_iter())
             .collect();
 
         let mut resolved: Vec<(usize, String)> = Vec::new();
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
-        let mut data_scripts: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
+        let mut data_scripts: std::collections::HashMap<usize, (String, String)> =
+            std::collections::HashMap::new();
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
@@ -276,10 +306,13 @@ impl Page {
                     continue;
                 }
 
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
+                {
                     src_url.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
+                    base.join(src_url)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src_url.clone())
                 } else {
                     src_url.clone()
                 };
@@ -294,25 +327,30 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let url = url.clone();
-            let idx = *idx;
-            async move {
-                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch script {}: {}", url, e);
-                        None
+        let fetch_futures: Vec<_> = fetch_tasks
+            .iter()
+            .map(|(idx, url)| {
+                let client = client.clone();
+                let url = url.clone();
+                let idx = *idx;
+                async move {
+                    let parsed =
+                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((idx, url, resp)),
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let fetch_results = futures::future::join_all(fetch_futures).await;
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+            std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
                 let code = String::from_utf8_lossy(&resp.body).to_string();
@@ -333,13 +371,23 @@ impl Page {
                         }
                         let _ = js.execute_script(
                             "<resource-load>",
-                            &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                            &format!(
+                                "globalThis.__obscura_finish_resource_node({}, false, '')",
+                                script.node_id
+                            ),
                         );
                         js.clear_current_script();
                     }
                 } else if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                    self.record_network_event(
+                        &url,
+                        "GET",
+                        "Script",
+                        resp.status,
+                        &resp.headers,
+                        resp.body.len(),
+                    );
                     if let Some(js) = &mut self.js {
                         js.set_current_script(script.node_id);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
@@ -347,7 +395,10 @@ impl Page {
                         }
                         let _ = js.execute_script(
                             "<resource-load>",
-                            &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                            &format!(
+                                "globalThis.__obscura_finish_resource_node({}, false, '')",
+                                script.node_id
+                            ),
                         );
                         js.clear_current_script();
                         pump_after_script = true;
@@ -362,7 +413,10 @@ impl Page {
                     }
                     let _ = js.execute_script(
                         "<resource-load>",
-                        &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                        &format!(
+                            "globalThis.__obscura_finish_resource_node({}, false, '')",
+                            script.node_id
+                        ),
                     );
                     js.clear_current_script();
                     pump_after_script = inline_len >= 10_000;
@@ -370,7 +424,8 @@ impl Page {
             }
 
             if pump_after_script {
-                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300))
+                    .await;
             }
         }
 
@@ -379,7 +434,9 @@ impl Page {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
+                    base.join(src)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src.clone())
                 } else {
                     src.clone()
                 };
@@ -394,7 +451,10 @@ impl Page {
                             module_loaded = true;
                             let _ = js.execute_script(
                                 "<resource-load>",
-                                &format!("globalThis.__obscura_finish_resource_node({}, false, '')", module_script.node_id),
+                                &format!(
+                                    "globalThis.__obscura_finish_resource_node({}, false, '')",
+                                    module_script.node_id
+                                ),
                             );
                         }
                         Err(e) => {
@@ -404,9 +464,17 @@ impl Page {
                     js.clear_current_script();
                 }
                 if module_loaded {
-                    self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
+                    self.record_network_event(
+                        &full_url,
+                        "GET",
+                        "Script",
+                        200,
+                        &std::collections::HashMap::new(),
+                        0,
+                    );
                 }
-                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300))
+                    .await;
             } else if !module_script.inline.is_empty() {
                 let base = self.url_string();
                 if let Some(js) = &mut self.js {
@@ -416,11 +484,15 @@ impl Page {
                     }
                     let _ = js.execute_script(
                         "<resource-load>",
-                        &format!("globalThis.__obscura_finish_resource_node({}, false, '')", module_script.node_id),
+                        &format!(
+                            "globalThis.__obscura_finish_resource_node({}, false, '')",
+                            module_script.node_id
+                        ),
                     );
                     js.clear_current_script();
                 }
-                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300))
+                    .await;
             }
         }
 
@@ -433,7 +505,8 @@ impl Page {
                  try { window.dispatchEvent(new Event('load')); } catch(e) {}");
         }
 
-        self.pump_event_loop_for(tokio::time::Duration::from_secs(3)).await;
+        self.pump_event_loop_for(tokio::time::Duration::from_secs(3))
+            .await;
     }
 
     pub async fn pump_event_loop_for(&mut self, duration: tokio::time::Duration) {
@@ -446,10 +519,12 @@ impl Page {
         let mut idle_count = 0u32;
 
         loop {
-            let result = js.run_event_loop_slice(
-                tokio::time::Duration::from_millis(25),
-                std::time::Duration::from_millis(250),
-            ).await;
+            let result = js
+                .run_event_loop_slice(
+                    tokio::time::Duration::from_millis(25),
+                    std::time::Duration::from_secs(2),
+                )
+                .await;
 
             if let Err(e) = result {
                 tracing::debug!("JS event loop pump error: {}", e);
@@ -475,7 +550,8 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
+            .await
     }
 
     pub async fn navigate_with_wait(
@@ -483,7 +559,8 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
+            .await
     }
 
     pub async fn navigate_with_wait_post(
@@ -497,9 +574,15 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         for _chain in 0..10 {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
+            self.navigate_single(&current_url, wait_until, &current_method, &current_body)
+                .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
-                tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                tracing::info!(
+                    "JS-triggered navigation chain: {} {} -> {}",
+                    current_method,
+                    current_url,
+                    next_url
+                );
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -555,7 +638,8 @@ impl Page {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
@@ -602,7 +686,9 @@ impl Page {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &self.url {
-                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
+                base.join(href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.clone())
             } else {
                 href.clone()
             };
@@ -614,27 +700,38 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let url_str = full_url.clone();
-            async move {
-                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((url_str, resp)),
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                        None
+        let css_futures: Vec<_> = css_fetch_urls
+            .iter()
+            .map(|full_url| {
+                let client = client.clone();
+                let url_str = full_url.clone();
+                async move {
+                    let parsed =
+                        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((url_str, resp)),
+                        Err(e) => {
+                            tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let css_results = futures::future::join_all(css_futures).await;
         let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {
                 let css = String::from_utf8_lossy(&resp.body).to_string();
-                self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
+                self.record_network_event(
+                    &url_str,
+                    "GET",
+                    "Stylesheet",
+                    resp.status,
+                    &resp.headers,
+                    resp.body.len(),
+                );
                 css_sources.push(css);
             }
         }
@@ -698,7 +795,9 @@ impl Page {
                     if idle_since.is_none() {
                         idle_since = Some(now);
                     }
-                    if now.duration_since(idle_since.unwrap()) >= tokio::time::Duration::from_millis(500) {
+                    if now.duration_since(idle_since.unwrap())
+                        >= tokio::time::Duration::from_millis(500)
+                    {
                         break;
                     }
                 } else {
@@ -706,15 +805,20 @@ impl Page {
                 }
 
                 if now >= deadline {
-                    tracing::debug!("Network idle timeout reached with {} active requests", active);
+                    tracing::debug!(
+                        "Network idle timeout reached with {} active requests",
+                        active
+                    );
                     break;
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = js.run_event_loop_slice(
-                        tokio::time::Duration::from_millis(50),
-                        std::time::Duration::from_millis(250),
-                    ).await;
+                    let _ = js
+                        .run_event_loop_slice(
+                            tokio::time::Duration::from_millis(50),
+                            std::time::Duration::from_millis(250),
+                        )
+                        .await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -729,7 +833,9 @@ impl Page {
     pub fn navigate_blank(&mut self) {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
-        self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
+        self.dom = Some(parse_html(
+            "<!DOCTYPE html><html><head></head><body></body></html>",
+        ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
     }
@@ -737,12 +843,11 @@ impl Page {
     pub fn set_viewport_metrics(&mut self, width: u32, height: u32, device_scale_factor: f64) {
         self.viewport_width = width.max(1);
         self.viewport_height = height.max(1);
-        self.device_scale_factor =
-            if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
-                device_scale_factor
-            } else {
-                2.0
-            };
+        self.device_scale_factor = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+            device_scale_factor
+        } else {
+            2.0
+        };
 
         if let Some(js) = &mut self.js {
             js.set_viewport_metrics(
@@ -750,6 +855,13 @@ impl Page {
                 self.viewport_height,
                 self.device_scale_factor,
             );
+        }
+    }
+
+    pub fn set_user_agent_override(&mut self, params: serde_json::Value) {
+        self.user_agent_override = Some(params);
+        if let (Some(js), Some(override_params)) = (&mut self.js, &self.user_agent_override) {
+            js.apply_user_agent_override(override_params);
         }
     }
 
@@ -776,7 +888,11 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!(
+                        "JS eval error for '{}': {}",
+                        &expression[..expression.len().min(80)],
+                        e
+                    );
                     serde_json::Value::Null
                 }
             }
@@ -838,7 +954,16 @@ impl Page {
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.call_function_on_for_cdp(function_declaration, object_id, args, return_by_value, await_promise).await {
+            match js
+                .call_function_on_for_cdp(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    await_promise,
+                )
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -945,7 +1070,10 @@ impl Page {
         }
     }
 
-    pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
+    pub fn set_intercept_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
