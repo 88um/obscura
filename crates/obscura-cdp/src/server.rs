@@ -88,44 +88,64 @@ async fn cdp_processor(
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
     let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut event_sinks: Vec<mpsc::UnboundedSender<String>> = Vec::new();
 
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            ServerMessage::NewConnection { reply_tx } => {
-                let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
-                );
-            }
-            ServerMessage::Cdp(cdp_msg) => {
-                let is_navigation = cdp_msg.text.contains("Page.navigate");
-                let has_interception = ctx.fetch_intercept.enabled;
+    loop {
+        let has_irx = intercept_rx.is_some();
 
-                if is_navigation && has_interception {
-                    process_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                    ).await;
+        tokio::select! {
+            Some(intercepted) = async {
+                if let Some(ref mut irx) = intercept_rx {
+                    irx.recv().await
                 } else {
-                    if cdp_msg.text.contains("Fetch.") {
-                        handle_fetch_resolution(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut intercepted_paused);
+                    std::future::pending().await
+                }
+            }, if has_irx => {
+                emit_intercepted_request(&ctx, &mut event_sinks, intercepted, &mut intercepted_paused);
+            }
+            Some(msg) = rx.recv() => {
+                match msg {
+                    ServerMessage::NewConnection { reply_tx } => {
+                        event_sinks.push(reply_tx.clone());
+                        let _ = reply_tx.send(
+                            json!({"__init": true})
+                                .to_string(),
+                        );
                     }
-                    process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                    ServerMessage::Cdp(cdp_msg) => {
+                        let is_navigation = cdp_msg.text.contains("Page.navigate");
+                        let has_interception = ctx.fetch_intercept.enabled;
+
+                        if is_navigation && has_interception {
+                            process_with_interception(
+                                &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
+                                &mut intercept_rx, &mut intercepted_paused,
+                            ).await;
+                        } else {
+                            let handled_fetch_resolution = cdp_msg.text.contains("Fetch.")
+                                && handle_fetch_resolution(&cdp_msg.text, &cdp_msg.reply_tx, &mut intercepted_paused);
+                            if !handled_fetch_resolution {
+                                process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                            }
+                        }
+                    }
                 }
             }
+            else => break,
         }
-
     }
 }
 
 fn handle_fetch_resolution(
     text: &str,
-    ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
-) {
+) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+            return false;
+        }
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
@@ -151,15 +171,100 @@ fn handle_fetch_resolution(
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
                     obscura_js::ops::InterceptResolution::Fail { reason }
                 }
-                _ => return,
+                _ => return false,
             };
             let _ = resolver.send(resolution);
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
+            return true;
         }
     }
+
+    false
+}
+
+fn emit_intercepted_request(
+    ctx: &CdpContext,
+    event_sinks: &mut Vec<mpsc::UnboundedSender<String>>,
+    intercepted: obscura_js::ops::InterceptedRequest,
+    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+) {
+    let Some((session_id, frame_id, document_url)) = current_intercept_target(ctx) else {
+        let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: None,
+        });
+        return;
+    };
+
+    let request_id = intercepted.request_id.clone();
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let request = json!({
+        "url": intercepted.url,
+        "method": intercepted.method,
+        "headers": intercepted.headers,
+        "initialPriority": "High",
+        "referrerPolicy": "strict-origin-when-cross-origin",
+    });
+
+    let network_event = json!({
+        "method": "Network.requestWillBeSent",
+        "params": {
+            "requestId": request_id,
+            "loaderId": "",
+            "documentURL": document_url,
+            "request": request.clone(),
+            "timestamp": ts,
+            "wallTime": ts,
+            "initiator": {"type": "script"},
+            "type": intercepted.resource_type,
+            "frameId": frame_id,
+        },
+        "sessionId": session_id,
+    });
+    let paused_event = json!({
+        "method": "Fetch.requestPaused",
+        "params": {
+            "requestId": request_id,
+            "request": request,
+            "frameId": frame_id,
+            "resourceType": intercepted.resource_type,
+            "networkId": request_id,
+            "responseErrorReason": null,
+            "responseStatusCode": null,
+            "responseHeaders": null,
+        },
+        "sessionId": session_id,
+    });
+
+    let network_sent = broadcast_json(event_sinks, network_event.to_string());
+    let paused_sent = broadcast_json(event_sinks, paused_event.to_string());
+    let sent = network_sent || paused_sent;
+    if sent {
+        intercepted_paused.insert(request_id, intercepted.resolver);
+    } else {
+        let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: None,
+        });
+    }
+}
+
+fn current_intercept_target(ctx: &CdpContext) -> Option<(String, String, String)> {
+    ctx.sessions.iter().find_map(|(session_id, page_id)| {
+        let page = ctx.get_page(page_id)?;
+        Some((session_id.clone(), page.frame_id.clone(), page.url_string()))
+    })
+}
+
+fn broadcast_json(event_sinks: &mut Vec<mpsc::UnboundedSender<String>>, message: String) -> bool {
+    let mut sent = false;
+    event_sinks.retain(|tx| {
+        let ok = tx.send(message.clone()).is_ok();
+        sent |= ok;
+        ok
+    });
+    sent
 }
 
 async fn process_with_interception(
@@ -326,9 +431,9 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.") {
-                            handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
-                        } else {
+                        let handled_fetch_resolution = msg.text.contains("Fetch.")
+                            && handle_fetch_resolution(&msg.text, &msg.reply_tx, intercepted_paused);
+                        if !handled_fetch_resolution {
                             process_cdp_message(&msg.text, ctx, &msg.reply_tx).await;
                         }
                     }

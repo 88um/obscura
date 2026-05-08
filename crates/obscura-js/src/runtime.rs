@@ -38,7 +38,7 @@ impl ObscuraJsRuntime {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
 
-        let module_loader = Rc::new(ObscuraModuleLoader::new(base_url));
+        let module_loader = Rc::new(ObscuraModuleLoader::new(base_url, state.clone()));
 
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![build_extension()],
@@ -362,7 +362,7 @@ impl ObscuraJsRuntime {
 
         let module_id = self
             .runtime
-            .load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from_static(""))
+            .load_side_es_module(&specifier)
             .await
             .map_err(|e| format!("Module load error: {}", e))?;
 

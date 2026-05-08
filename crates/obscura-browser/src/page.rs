@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
@@ -245,9 +246,15 @@ impl Page {
 
         let mut resolved: Vec<(usize, String)> = Vec::new();
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
+        let mut data_scripts: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
+                if let Some(code) = decode_data_script(src_url) {
+                    data_scripts.insert(i, (src_url.clone(), code));
+                    continue;
+                }
+
                 let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
                     src_url.clone()
                 } else if let Some(base) = &self.url {
@@ -294,7 +301,14 @@ impl Page {
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched.remove(&i) {
+                if let Some((url, code)) = data_scripts.remove(&i) {
+                    tracing::info!("Executing data script ({} bytes)", code.len());
+                    if let Some(js) = &mut self.js {
+                        if let Err(e) = js.execute_script_guarded(&url, &code) {
+                            tracing::warn!("Data script error: {}", e);
+                        }
+                    }
+                } else if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
@@ -842,6 +856,53 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
         }
+    }
+}
+
+fn decode_data_script(src: &str) -> Option<String> {
+    if !src.starts_with("data:") {
+        return None;
+    }
+
+    let comma = src.find(',')?;
+    let (metadata, data) = src.split_at(comma);
+    let data = &data[1..];
+    let bytes = if metadata.to_ascii_lowercase().contains(";base64") {
+        BASE64.decode(data).ok()?
+    } else {
+        percent_decode(data)
+    };
+
+    String::from_utf8(bytes).ok()
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

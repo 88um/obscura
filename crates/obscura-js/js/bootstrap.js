@@ -38,6 +38,9 @@ Function.prototype.toString = function() {
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 _nativeFns.add(Function.prototype.toString);
 
+class DOMStringMap {}
+globalThis.DOMStringMap = DOMStringMap;
+
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
     Object.defineProperty(E.prototype, 'name', {
@@ -725,7 +728,7 @@ class Element extends Node {
   }
   get dataset() {
     const el = this;
-    return new Proxy({}, {
+    return new Proxy(new DOMStringMap(), {
       get(_, k) { if(typeof k!=="string")return undefined; return el.getAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase()); },
       set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
     });

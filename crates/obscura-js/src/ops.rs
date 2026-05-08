@@ -356,8 +356,8 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            match resolve_rx.await {
-                Ok(InterceptResolution::Fulfill { status, headers: h, body: b }) => {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(250), resolve_rx).await {
+                Ok(Ok(InterceptResolution::Fulfill { status, headers: h, body: b })) => {
                     let resp_headers: HashMap<String, String> = h;
                     return Ok(serde_json::json!({
                         "status": status,
@@ -366,7 +366,7 @@ async fn op_fetch_url(
                         "headers": resp_headers,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Fail { reason }) => {
+                Ok(Ok(InterceptResolution::Fail { reason })) => {
                     return Ok(serde_json::json!({
                         "status": 0,
                         "body": "",
@@ -376,10 +376,13 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Continue { url: new_url, method: new_method, headers: new_headers, body: new_body }) => {
+                Ok(Ok(InterceptResolution::Continue { url: new_url, method: new_method, headers: new_headers, body: new_body })) => {
                     tracing::debug!("Interception: continue request {}", url);
                 }
+                Ok(Err(_)) => {
+                }
                 Err(_) => {
+                    tracing::debug!("Interception continuation timed out; continuing request {}", url);
                 }
             }
         }

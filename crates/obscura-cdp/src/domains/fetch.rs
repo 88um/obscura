@@ -83,7 +83,6 @@ pub async fn handle(
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_enabled = true;
-                page.intercept_block_patterns = patterns.clone();
                 if let Some(tx) = tx_clone {
                     page.set_intercept_tx(tx);
                 }

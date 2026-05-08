@@ -8,14 +8,18 @@ use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::RequestedModuleType;
 
+use crate::ops::SharedState;
+
 pub struct ObscuraModuleLoader {
     pub base_url: String,
+    state: SharedState,
 }
 
 impl ObscuraModuleLoader {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, state: SharedState) -> Self {
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
+            state,
         }
     }
 }
@@ -52,32 +56,57 @@ impl ModuleLoader for ObscuraModuleLoader {
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        let state = self.state.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            let client = reqwest::Client::builder()
-                .build()
-                .map_err(|e| io_err(format!("HTTP client error: {}", e)))?;
-
             tracing::debug!("Loading ES module: {}", url);
 
-            let resp = client
-                .get(&url)
-                .header("Accept", "application/javascript, text/javascript, */*")
-                .send()
-                .await
-                .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+            let http_client = {
+                let gs = state.borrow();
+                gs.http_client.clone()
+            };
 
-            if !resp.status().is_success() {
-                return Err(io_err(format!(
-                    "Module {} returned HTTP {}",
-                    url,
-                    resp.status()
-                )));
-            }
+            let code = if let Some(client) = http_client {
+                let parsed_url = url::Url::parse(&url)
+                    .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                let resp = client
+                    .fetch(&parsed_url)
+                    .await
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
 
-            let code = resp.text().await.map_err(|e| {
-                io_err(format!("Failed to read module body {}: {}", url, e))
-            })?;
+                if !(200..300).contains(&resp.status) {
+                    return Err(io_err(format!(
+                        "Module {} returned HTTP {}",
+                        url,
+                        resp.status
+                    )));
+                }
+
+                String::from_utf8_lossy(&resp.body).to_string()
+            } else {
+                let client = reqwest::Client::builder()
+                    .build()
+                    .map_err(|e| io_err(format!("HTTP client error: {}", e)))?;
+
+                let resp = client
+                    .get(&url)
+                    .header("Accept", "application/javascript, text/javascript, */*")
+                    .send()
+                    .await
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+
+                if !resp.status().is_success() {
+                    return Err(io_err(format!(
+                        "Module {} returned HTTP {}",
+                        url,
+                        resp.status()
+                    )));
+                }
+
+                resp.text().await.map_err(|e| {
+                    io_err(format!("Failed to read module body {}: {}", url, e))
+                })?
+            };
 
             let specifier = ModuleSpecifier::parse(&url)
                 .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
