@@ -314,6 +314,7 @@ fn emit_intercepted_request(
     if sent {
         spawn_intercepted_response_events(
             event_sinks.clone(),
+            ctx.network_response_bodies.clone(),
             Some(session_id),
             frame_id,
             String::new(),
@@ -336,6 +337,9 @@ fn emit_intercepted_request(
 
 fn spawn_intercepted_response_events(
     sinks: Vec<mpsc::UnboundedSender<String>>,
+    response_bodies: std::sync::Arc<
+        tokio::sync::Mutex<HashMap<String, dispatch::NetworkResponseBody>>,
+    >,
     session_id: Option<String>,
     frame_id: String,
     loader_id: String,
@@ -358,6 +362,14 @@ fn spawn_intercepted_response_events(
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
+
+        response_bodies.lock().await.insert(
+            request_id.clone(),
+            dispatch::NetworkResponseBody {
+                body: response.body.clone(),
+                base64_encoded: response.base64_encoded,
+            },
+        );
 
         let response_event = json!({
             "method": "Network.responseReceived",
@@ -608,6 +620,7 @@ async fn process_with_interception(
                 let _ = reply_tx.send(event_str);
                 spawn_intercepted_response_events(
                     vec![reply_tx.clone()],
+                    ctx.network_response_bodies.clone(),
                     session_for_events.clone(),
                     frame_id.clone(),
                     loader_id.clone(),

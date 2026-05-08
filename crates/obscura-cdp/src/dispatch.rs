@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
-use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
+
+#[derive(Clone, Debug)]
+pub struct NetworkResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
 
 pub struct CdpContext {
     pub pages: Vec<Page>,
@@ -27,6 +34,7 @@ pub struct CdpContext {
     pub isolated_worlds: Vec<String>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub network_response_bodies: Arc<Mutex<HashMap<String, NetworkResponseBody>>>,
 }
 
 impl CdpContext {
@@ -64,6 +72,7 @@ impl CdpContext {
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
+            network_response_bodies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

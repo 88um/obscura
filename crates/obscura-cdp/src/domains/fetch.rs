@@ -1,11 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 
 use crate::dispatch::CdpContext;
-use crate::types::CdpEvent;
 
 pub struct PausedRequest {
     pub request_id: String,
@@ -189,7 +186,20 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("requestId required")?;
+            let bodies = ctx.network_response_bodies.lock().await;
+            let body = bodies.get(request_id).ok_or_else(|| {
+                format!("No resource with given identifier found: {}", request_id)
+            })?;
+            Ok(json!({
+                "body": body.body.clone(),
+                "base64Encoded": body.base64_encoded,
+            }))
+        }
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
 }

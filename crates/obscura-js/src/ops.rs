@@ -52,6 +52,8 @@ pub struct InterceptedResponse {
     pub url: String,
     pub status: u16,
     pub headers: HashMap<String, String>,
+    pub body: String,
+    pub base64_encoded: bool,
     pub encoded_data_length: usize,
 }
 
@@ -674,6 +676,8 @@ async fn op_fetch_url(
             url: url.clone(),
             status,
             headers: resp_headers.clone(),
+            body: resp_body.clone(),
+            base64_encoded: false,
             encoded_data_length: resp_bytes.len(),
         });
     }

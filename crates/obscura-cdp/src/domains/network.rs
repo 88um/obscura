@@ -79,6 +79,20 @@ pub async fn handle(
         }
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("requestId required")?;
+            let bodies = ctx.network_response_bodies.lock().await;
+            let body = bodies.get(request_id).ok_or_else(|| {
+                format!("No resource with given identifier found: {}", request_id)
+            })?;
+            Ok(json!({
+                "body": body.body.clone(),
+                "base64Encoded": body.base64_encoded,
+            }))
+        }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
 }
@@ -166,5 +180,34 @@ mod tests {
         let url = url::Url::parse("https://www.instagram.com/graphql/query/").unwrap();
         let header = page.context.cookie_jar.get_cookie_header(&url);
         assert!(header.contains("sessionid=abc"));
+    }
+
+    #[tokio::test]
+    async fn get_response_body_returns_cached_body_by_request_id() {
+        let mut ctx = CdpContext::new();
+        ctx.network_response_bodies.lock().await.insert(
+            "request-1".to_string(),
+            crate::dispatch::NetworkResponseBody {
+                body: "{\"ok\":true}".to_string(),
+                base64_encoded: false,
+            },
+        );
+
+        let result = handle(
+            "getResponseBody",
+            &json!({"requestId": "request-1"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("Network.getResponseBody should return cached bodies");
+
+        assert_eq!(
+            result,
+            json!({
+                "body": "{\"ok\":true}",
+                "base64Encoded": false,
+            })
+        );
     }
 }
