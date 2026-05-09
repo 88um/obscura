@@ -11,6 +11,13 @@ use url::Url;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+pub const DEFAULT_SEC_CH_UA: &str =
+    "\"Google Chrome\";v=\"124\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"124\"";
+pub const DEFAULT_SEC_CH_UA_FULL_VERSION_LIST: &str = "\"Google Chrome\";v=\"124.0.0.0\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"124.0.0.0\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM: &str = "\"macOS\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM_VERSION: &str = "\"14.4.1\"";
+
 #[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
@@ -181,9 +188,7 @@ impl ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
+            user_agent: RwLock::new(DEFAULT_USER_AGENT.to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             on_request: RwLock::new(Vec::new()),
@@ -195,21 +200,22 @@ impl ObscuraHttpClient {
     }
 
     async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
-                .danger_accept_invalid_certs(false)
-;
+        self.client
+            .get_or_init(|| async {
+                let mut builder = Client::builder()
+                    .redirect(Policy::none())
+                    .timeout(Duration::from_secs(30))
+                    .danger_accept_invalid_certs(false);
 
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
+                if let Some(ref proxy) = self.proxy_url {
+                    if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                        builder = builder.proxy(p);
+                    }
                 }
-            }
 
-            builder.build().expect("failed to build HTTP client")
-        }).await
+                builder.build().expect("failed to build HTTP client")
+            })
+            .await
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -217,7 +223,8 @@ impl ObscuraHttpClient {
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec())).await
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()))
+            .await
     }
 
     pub async fn fetch_with_method(
@@ -281,11 +288,18 @@ impl ObscuraHttpClient {
                 cb(&request_info);
             }
 
-            let ua = self.user_agent.read().await.clone();
+            let configured_ua = self.user_agent.read().await.clone();
+            let ua = if configured_ua.trim().is_empty() {
+                DEFAULT_USER_AGENT.to_string()
+            } else {
+                configured_ua
+            };
             let mut headers = HeaderMap::new();
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            }));
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_str(&ua)
+                    .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT)),
+            );
             headers.insert(
                 reqwest::header::ACCEPT,
                 HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
@@ -296,7 +310,11 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static("\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\""),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-full-version-list"),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_FULL_VERSION_LIST),
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-mobile"),
@@ -304,7 +322,11 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_static("\"Linux\""),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_PLATFORM),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-platform-version"),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_PLATFORM_VERSION),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-dest"),
@@ -333,8 +355,10 @@ impl ObscuraHttpClient {
                     headers.insert(reqwest::header::COOKIE, val);
                 }
             }
-
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("user-agent") && v.trim().is_empty() {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -343,7 +367,10 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
+            let mut req_builder = self
+                .get_client()
+                .await
+                .request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
@@ -356,12 +383,15 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
-            self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = req_builder.send().await.map_err(|e| {
-                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
-            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             let status = resp.status();
 
@@ -374,7 +404,12 @@ impl ObscuraHttpClient {
             let response_headers: HashMap<String, String> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_lowercase(),
+                        v.to_str().unwrap_or("").to_string(),
+                    )
+                })
                 .collect();
 
             if status.is_redirection() {
@@ -399,9 +434,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
+                .to_vec();
 
             let response = Response {
                 url: current_url,
@@ -422,7 +459,11 @@ impl ObscuraHttpClient {
     }
 
     pub async fn set_user_agent(&self, ua: &str) {
-        *self.user_agent.write().await = ua.to_string();
+        *self.user_agent.write().await = if ua.trim().is_empty() {
+            DEFAULT_USER_AGENT.to_string()
+        } else {
+            ua.to_string()
+        };
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -441,6 +482,22 @@ impl ObscuraHttpClient {
 impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_user_agent_uses_default_for_blank_value() {
+        let client = ObscuraHttpClient::new();
+        client.set_user_agent("").await;
+        assert_eq!(
+            client.user_agent.read().await.as_str(),
+            DEFAULT_USER_AGENT,
+            "blank UA overrides must not produce empty User-Agent headers"
+        );
     }
 }
 

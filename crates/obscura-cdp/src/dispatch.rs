@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
-use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
+
+#[derive(Clone, Debug)]
+pub struct NetworkResponseBody {
+    pub body: String,
+    pub base64_encoded: bool,
+}
 
 pub struct CdpContext {
     pub pages: Vec<Page>,
@@ -27,6 +34,7 @@ pub struct CdpContext {
     pub isolated_worlds: Vec<String>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub network_response_bodies: Arc<Mutex<HashMap<String, NetworkResponseBody>>>,
 }
 
 impl CdpContext {
@@ -64,6 +72,7 @@ impl CdpContext {
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
+            network_response_bodies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -71,6 +80,9 @@ impl CdpContext {
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
         let mut page = Page::new(page_id.clone(), self.default_context.clone());
+        if let Some(tx) = &self.intercept_tx {
+            page.set_network_event_tx(tx.clone());
+        }
         page.navigate_blank();
         self.pages.push(page);
         page_id
@@ -90,9 +102,7 @@ impl CdpContext {
     }
 
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {
-        let page_id = session_id
-            .as_ref()
-            .and_then(|sid| self.sessions.get(sid))?;
+        let page_id = session_id.as_ref().and_then(|sid| self.sessions.get(sid))?;
         self.get_page(page_id)
     }
 
@@ -142,18 +152,17 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
+        "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
-        "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        "Accessibility" => {
+            domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
-        | "ServiceWorker" | "Inspector"
-        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
-        | "Audits" => {
-            Ok(json!({}))
-        }
+        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
+        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
@@ -184,7 +193,11 @@ mod tests {
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
         let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
-        assert!(resp.error.is_none(), "Audits.enable should not error: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "Audits.enable should not error: {:?}",
+            resp.error
+        );
         assert_eq!(resp.result, Some(json!({})));
     }
 

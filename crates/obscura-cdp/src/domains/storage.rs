@@ -45,17 +45,21 @@ pub async fn handle(
                         Some(n) => n.to_string(),
                         None => continue,
                     };
-                    let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let value = c
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
-                    let domain = c
+                    let mut domain = c
                         .get("domain")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
+                        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
                         .or_else(|| {
                             c.get("url")
                                 .and_then(|v| v.as_str())
                                 .and_then(|u| url::Url::parse(u).ok())
-                                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
                         })
                         .unwrap_or_default();
 
@@ -67,15 +71,34 @@ pub async fn handle(
                         }
                     }
 
-                    let path = c
+                    let mut path = c
                         .get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("/")
                         .to_string();
-                    let secure =
-                        c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let http_only =
-                        c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let mut secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    if domain.is_empty() {
+                        if let Some(parsed) = c
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .and_then(|u| url::Url::parse(u).ok())
+                        {
+                            if let Some(host) = parsed.host_str() {
+                                domain = host.to_ascii_lowercase();
+                            }
+                            if c.get("path").is_none() {
+                                path = default_cookie_path(parsed.path());
+                            }
+                            secure = secure || parsed.scheme() == "https";
+                        }
+                    }
+
+                    if domain.is_empty() {
+                        continue;
+                    }
+
+                    let http_only = c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
 
                     ctx.default_context.cookie_jar.set_cookies_from_cdp(vec![
                         obscura_net::CookieInfo {
@@ -106,12 +129,20 @@ pub async fn handle(
                 .unwrap_or_default();
 
             if !name.is_empty() {
-                ctx.default_context
-                    .cookie_jar
-                    .delete_cookie(name, &domain);
+                ctx.default_context.cookie_jar.delete_cookie(name, &domain);
             }
             Ok(json!({}))
         }
         _ => Ok(json!({})),
+    }
+}
+
+fn default_cookie_path(url_path: &str) -> String {
+    if !url_path.starts_with('/') || url_path == "/" {
+        return "/".to_string();
+    }
+    match url_path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => url_path[..index].to_string(),
     }
 }
