@@ -134,6 +134,9 @@ pub async fn handle(
 
             if ctx.fetch_intercept.enabled {
                 for net_event in &network_events {
+                    if !ctx.fetch_intercept.should_pause_url(&net_event.url) {
+                        continue;
+                    }
                     ctx.pending_events.push(CdpEvent {
                         method: "Fetch.requestPaused".into(),
                         params: json!({

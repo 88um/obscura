@@ -332,7 +332,8 @@ fn emit_intercepted_request(
         "sessionId": session_id,
     });
     let network_sent = broadcast_json(event_sinks, network_event.to_string());
-    let paused_sent = if intercepted.pause && ctx.fetch_intercept.enabled {
+    let should_pause = intercepted.pause && ctx.fetch_intercept.should_pause_url(&intercepted.url);
+    let paused_sent = if should_pause {
         let paused_event = json!({
             "method": "Fetch.requestPaused",
             "params": {
@@ -649,27 +650,10 @@ async fn process_with_interception(
                         "type": resource_type,
                         "frameId": frame_id,
                     },
-                    "sessionId": session_for_events,
+            "sessionId": session_for_events,
                 });
                 let _ = reply_tx.send(rws_event.to_string());
 
-                let event_json = json!({
-                    "method": "Fetch.requestPaused",
-                    "params": {
-                        "requestId": request_id,
-                        "request": request_payload,
-                        "frameId": frame_id,
-                        "resourceType": resource_type,
-                        "networkId": request_id,
-                        "responseErrorReason": null,
-                        "responseStatusCode": null,
-                        "responseHeaders": null,
-                    },
-                    "sessionId": session_for_events,
-                });
-                let event_str = event_json.to_string();
-                tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
-                let _ = reply_tx.send(event_str);
                 spawn_intercepted_response_events(
                     vec![reply_tx.clone()],
                     ctx.network_response_bodies.clone(),
@@ -677,10 +661,38 @@ async fn process_with_interception(
                     frame_id.clone(),
                     loader_id.clone(),
                     request_id.clone(),
-                    resource_type,
+                    resource_type.clone(),
                     response_rx,
                 );
-                intercepted_paused.insert(request_id, intercepted.resolver);
+                if intercepted.pause && ctx.fetch_intercept.should_pause_url(&intercepted.url) {
+                    let event_json = json!({
+                        "method": "Fetch.requestPaused",
+                        "params": {
+                            "requestId": request_id,
+                            "request": request_payload,
+                            "frameId": frame_id,
+                            "resourceType": resource_type,
+                            "networkId": request_id,
+                            "responseErrorReason": null,
+                            "responseStatusCode": null,
+                            "responseHeaders": null,
+                        },
+                        "sessionId": session_for_events,
+                    });
+                    let event_str = event_json.to_string();
+                    tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
+                    let _ = reply_tx.send(event_str);
+                    intercepted_paused.insert(request_id, intercepted.resolver);
+                } else {
+                    let _ = intercepted
+                        .resolver
+                        .send(obscura_js::ops::InterceptResolution::Continue {
+                            url: None,
+                            method: None,
+                            headers: None,
+                            body: None,
+                        });
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
             Some(msg) = rx.recv() => {

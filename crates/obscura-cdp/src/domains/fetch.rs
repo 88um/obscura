@@ -51,6 +51,55 @@ impl FetchInterceptState {
         self.request_counter += 1;
         format!("interception-{}", self.request_counter)
     }
+
+    pub fn should_pause_url(&self, url: &str) -> bool {
+        self.enabled
+            && (self.patterns.is_empty()
+                || self
+                    .patterns
+                    .iter()
+                    .any(|pattern| cdp_url_pattern_matches(pattern, url)))
+    }
+}
+
+pub fn cdp_url_pattern_matches(pattern: &str, url: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+
+    wildcard_match(pattern, url)
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star = None;
+    let mut star_text = 0usize;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            star_text = t;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            star_text += 1;
+            t = star_text;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 pub async fn handle(
@@ -279,5 +328,46 @@ fn decode_cdp_post_data(input: &str) -> String {
         decoded
     } else {
         input.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cdp_url_pattern_supports_playwright_wildcards() {
+        assert!(cdp_url_pattern_matches(
+            "**/graphql/query*",
+            "https://www.instagram.com/graphql/query/?doc_id=1"
+        ));
+        assert!(cdp_url_pattern_matches(
+            "*://www.instagram.com/api/graphql*",
+            "https://www.instagram.com/api/graphql"
+        ));
+        assert!(!cdp_url_pattern_matches(
+            "**/graphql/query*",
+            "https://www.instagram.com/static/bundle.js"
+        ));
+    }
+
+    #[test]
+    fn fetch_intercept_state_pauses_only_matching_urls() {
+        let mut state = FetchInterceptState::new();
+        state.enabled = true;
+        state.patterns = vec!["**/graphql/query*".to_string()];
+
+        assert!(state.should_pause_url("https://www.instagram.com/graphql/query/?variables=abc"));
+        assert!(!state.should_pause_url("https://www.instagram.com/static/bundle.js"));
+    }
+
+    #[test]
+    fn fetch_intercept_state_empty_patterns_match_all_when_enabled() {
+        let mut state = FetchInterceptState::new();
+        state.enabled = true;
+        assert!(state.should_pause_url("https://www.instagram.com/anything"));
+
+        state.enabled = false;
+        assert!(!state.should_pause_url("https://www.instagram.com/anything"));
     }
 }
