@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -474,6 +475,10 @@ fn intercepted_request_payload(
     });
     if !intercepted.body.is_empty() {
         request["postData"] = json!(intercepted.body);
+        request["hasPostData"] = json!(true);
+        request["postDataEntries"] = json!([{
+            "bytes": BASE64.encode(intercepted.body.as_bytes()),
+        }]);
     }
     request
 }
@@ -1262,6 +1267,39 @@ mod tests {
         assert_eq!(
             decode_cdp_post_data("{\"cursor\":\"already-plain\"}"),
             "{\"cursor\":\"already-plain\"}"
+        );
+    }
+
+    #[test]
+    fn intercepted_request_payload_includes_chromium_post_data_entries() {
+        let (resolver, _resolution_rx) = tokio::sync::oneshot::channel();
+        let (_response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = obscura_js::ops::InterceptedRequest {
+            page_id: Some("page-1".to_string()),
+            page_url: "https://www.instagram.com/nba/".to_string(),
+            request_id: "request-1".to_string(),
+            url: "https://www.instagram.com/graphql/query".to_string(),
+            method: "POST".to_string(),
+            headers: HashMap::new(),
+            body: "variables=%7B%22after%22%3A%22cursor-a%22%7D".to_string(),
+            resource_type: "Fetch".to_string(),
+            pause: true,
+            resolver,
+            response_rx,
+        };
+
+        let payload = intercepted_request_payload(&request);
+
+        assert_eq!(payload["hasPostData"], json!(true));
+        assert_eq!(
+            payload["postData"],
+            json!("variables=%7B%22after%22%3A%22cursor-a%22%7D")
+        );
+        assert_eq!(
+            payload["postDataEntries"],
+            json!([{
+                "bytes": BASE64.encode("variables=%7B%22after%22%3A%22cursor-a%22%7D")
+            }])
         );
     }
 }

@@ -2149,6 +2149,64 @@ function _arrayBufferFromBytes(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
+function _isRequestObject(value) {
+  return typeof Request !== "undefined" && value instanceof Request;
+}
+
+function _headersToObject(headers) {
+  if (!headers) return {};
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    return Object.fromEntries(headers.entries());
+  }
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers.map(([k, v]) => [String(k), String(v)]));
+  }
+  if (typeof headers.entries === "function") {
+    return Object.fromEntries(Array.from(headers.entries()).map(([k, v]) => [String(k), String(v)]));
+  }
+  if (typeof headers === "object") {
+    return Object.fromEntries(Object.entries(headers).map(([k, v]) => [String(k), String(v)]));
+  }
+  return {};
+}
+
+async function _fetchBodyToString(body) {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return body.toString();
+  if (typeof Blob !== "undefined" && body instanceof Blob) return await body.text();
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(_bodyToUint8Array(body));
+  }
+  return String(body);
+}
+
+async function _requestBodyToString(input, init = {}) {
+  if (init && "body" in Object(init) && init.body != null) {
+    return _fetchBodyToString(init.body);
+  }
+  if (_isRequestObject(init)) {
+    if (typeof init.clone === "function") {
+      try {
+        const clone = init.clone();
+        if (clone && typeof clone.text === "function") return await clone.text();
+      } catch(e) {}
+    }
+  }
+  if (_isRequestObject(input)) {
+    if (typeof input.clone === "function") {
+      try {
+        const clone = input.clone();
+        if (clone && typeof clone.text === "function") return await clone.text();
+      } catch(e) {}
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "body")) {
+      try { return await _fetchBodyToString(input.body); } catch(e) {}
+    }
+  }
+  return "";
+}
+
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
@@ -2169,9 +2227,11 @@ function _installWasmStreamingFallback() {
 _installWasmStreamingFallback();
 
 globalThis.fetch = async (input, init = {}) => {
+  const inputIsRequest = _isRequestObject(input);
+  const initIsRequest = _isRequestObject(init);
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
+    : (inputIsRequest
       ? input.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
@@ -2180,10 +2240,13 @@ globalThis.fetch = async (input, init = {}) => {
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  const hdrs = JSON.stringify(init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers || {});
-  const body = init.body ? String(init.body) : "";
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const method = init.method || (inputIsRequest ? input.method : "GET");
+  const headerSource = init && "headers" in Object(init)
+    ? init.headers
+    : (initIsRequest ? init.headers : (inputIsRequest ? input.headers : undefined));
+  const hdrs = JSON.stringify(_headersToObject(headerSource));
+  const body = await _requestBodyToString(input, init);
+  const fetchMode = init.mode || (initIsRequest ? init.mode : (inputIsRequest ? input.mode : "cors"));
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
   const parsed = JSON.parse(raw);
@@ -2195,6 +2258,8 @@ globalThis.fetch = async (input, init = {}) => {
     blocked: !!parsed.blocked,
     corsBlocked: !!parsed.corsBlocked,
     contentType: (parsed.headers && (parsed.headers['content-type'] || parsed.headers['Content-Type'])) || '',
+    requestBodyBytes: body.length,
+    requestBodyPrefix: String(body || '').slice(0, 240),
     bodyPrefix: String(parsed.body || '').slice(0, 240),
     bodyBase64Bytes: parsed.bodyBase64 ? String(parsed.bodyBase64).length : 0,
   });

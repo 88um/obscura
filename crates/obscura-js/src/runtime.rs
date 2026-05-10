@@ -1692,6 +1692,112 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_fetch_request_input_forwards_headers_and_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body) => {
+                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body };
+                        return JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "application/json" },
+                            body: "{}",
+                            url,
+                        });
+                    };
+                    const request = new Request("http://example.com/graphql/query", {
+                        method: "POST",
+                        headers: {
+                            "content-type": "application/x-www-form-urlencoded",
+                            "x-fb-friendly-name": "PolarisProfilePostsQuery",
+                        },
+                        body: "variables=%7B%22after%22%3A%22cursor-a%22%7D",
+                    });
+                    await fetch(request);
+                    return globalThis.__capturedFetch;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "url": "http://example.com/graphql/query",
+                "method": "POST",
+                "headers": {
+                    "content-type": "application/x-www-form-urlencoded",
+                    "x-fb-friendly-name": "PolarisProfilePostsQuery",
+                },
+                "body": "variables=%7B%22after%22%3A%22cursor-a%22%7D",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fetch_request_init_forwards_headers_and_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body) => {
+                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body };
+                        return JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "application/json" },
+                            body: "{}",
+                            url,
+                        });
+                    };
+                    const request = new Request("http://example.com/ignored", {
+                        method: "POST",
+                        headers: {
+                            "content-type": "application/x-www-form-urlencoded",
+                            "x-fb-friendly-name": "PolarisProfilePageContentQuery",
+                        },
+                        body: "variables=%7B%22after%22%3A%22cursor-b%22%7D",
+                    });
+                    await fetch("http://example.com/graphql/query", request);
+                    return globalThis.__capturedFetch;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "url": "http://example.com/graphql/query",
+                "method": "POST",
+                "headers": {
+                    "content-type": "application/x-www-form-urlencoded",
+                    "x-fb-friendly-name": "PolarisProfilePageContentQuery",
+                },
+                "body": "variables=%7B%22after%22%3A%22cursor-b%22%7D",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt

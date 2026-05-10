@@ -10,10 +10,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.6"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/h4ckf0r0day/obscura"
+repository = "https://github.com/88um/obscura"
 
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }
