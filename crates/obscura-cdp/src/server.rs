@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -20,7 +20,11 @@ struct CdpMessage {
 enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
+        connection_id: u64,
         reply_tx: mpsc::UnboundedSender<String>,
+    },
+    ConnectionClosed {
+        connection_id: u64,
     },
 }
 
@@ -59,13 +63,18 @@ pub async fn start_with_full_options(
             let processor_handle =
                 tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, user_agent));
 
+            let mut next_connection_id = 0u64;
+
             loop {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         info!("New connection from {}", peer_addr);
+                        next_connection_id = next_connection_id.wrapping_add(1);
+                        let connection_id = next_connection_id;
                         let tx = msg_tx.clone();
                         tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(stream, port, tx).await {
+                            if let Err(e) = handle_connection(stream, port, connection_id, tx).await
+                            {
                                 if !format!("{}", e).contains("close") {
                                     error!("Connection error from {}: {}", peer_addr, e);
                                 }
@@ -94,7 +103,8 @@ async fn cdp_processor(
         String,
         tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
     > = HashMap::new();
-    let mut event_sinks: Vec<mpsc::UnboundedSender<String>> = Vec::new();
+    let mut event_sinks: Vec<(u64, mpsc::UnboundedSender<String>)> = Vec::new();
+    let mut active_connections: HashSet<u64> = HashSet::new();
     let mut page_tick = tokio::time::interval(tokio::time::Duration::from_millis(50));
     page_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -116,12 +126,27 @@ async fn cdp_processor(
             }
             Some(msg) = rx.recv() => {
                 match msg {
-                    ServerMessage::NewConnection { reply_tx } => {
-                        event_sinks.push(reply_tx.clone());
+                    ServerMessage::NewConnection { connection_id, reply_tx } => {
+                        active_connections.insert(connection_id);
+                        event_sinks.push((connection_id, reply_tx.clone()));
+                        log_cdp_state(&ctx, "client_connected", active_connections.len()).await;
                         let _ = reply_tx.send(
                             json!({"__init": true})
                                 .to_string(),
                         );
+                    }
+                    ServerMessage::ConnectionClosed { connection_id } => {
+                        active_connections.remove(&connection_id);
+                        event_sinks.retain(|(sink_connection_id, _)| *sink_connection_id != connection_id);
+                        log_cdp_state(&ctx, "client_disconnected", active_connections.len()).await;
+                        if active_connections.is_empty() {
+                            cleanup_after_all_clients_disconnected(
+                                &mut ctx,
+                                &mut intercepted_paused,
+                                "last_client_disconnected",
+                            ).await;
+                            log_cdp_state(&ctx, "client_cleanup_finished", active_connections.len()).await;
+                        }
                     }
                     ServerMessage::Cdp(cdp_msg) => {
                         let is_navigation = cdp_msg.text.contains("Page.navigate");
@@ -131,6 +156,7 @@ async fn cdp_processor(
                             process_with_interception(
                                 &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                                 &mut intercept_rx, &mut intercepted_paused,
+                                &mut event_sinks, &mut active_connections,
                             ).await;
                         } else {
                             let handled_fetch_resolution = cdp_msg.text.contains("Fetch.")
@@ -287,7 +313,7 @@ fn parse_cdp_headers(value: Option<&Value>) -> Option<HashMap<String, String>> {
 
 fn emit_intercepted_request(
     ctx: &CdpContext,
-    event_sinks: &mut Vec<mpsc::UnboundedSender<String>>,
+    event_sinks: &mut Vec<(u64, mpsc::UnboundedSender<String>)>,
     intercepted: obscura_js::ops::InterceptedRequest,
     intercepted_paused: &mut HashMap<
         String,
@@ -355,8 +381,12 @@ fn emit_intercepted_request(
     };
     let sent = network_sent || paused_sent;
     if sent {
+        let response_sinks = event_sinks
+            .iter()
+            .map(|(_, sink)| sink.clone())
+            .collect::<Vec<_>>();
         spawn_intercepted_response_events(
-            event_sinks.clone(),
+            response_sinks,
             ctx.network_response_bodies.clone(),
             Some(session_id),
             frame_id,
@@ -514,9 +544,12 @@ fn current_intercept_target(
     })
 }
 
-fn broadcast_json(event_sinks: &mut Vec<mpsc::UnboundedSender<String>>, message: String) -> bool {
+fn broadcast_json(
+    event_sinks: &mut Vec<(u64, mpsc::UnboundedSender<String>)>,
+    message: String,
+) -> bool {
     let mut sent = false;
-    event_sinks.retain(|tx| {
+    event_sinks.retain(|(_, tx)| {
         let ok = tx.send(message.clone()).is_ok();
         sent |= ok;
         ok
@@ -534,6 +567,8 @@ async fn process_with_interception(
         String,
         tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
     >,
+    event_sinks: &mut Vec<(u64, mpsc::UnboundedSender<String>)>,
+    active_connections: &mut HashSet<u64>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -703,11 +738,24 @@ async fn process_with_interception(
             Some(msg) = rx.recv() => {
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
-                    ServerMessage::NewConnection { reply_tx: new_tx } => {
+                    ServerMessage::NewConnection { connection_id, reply_tx: new_tx } => {
+                        active_connections.insert(connection_id);
+                        event_sinks.push((connection_id, new_tx.clone()));
                         let pid = ctx.create_page();
                         let sid = format!("{}-session", pid);
                         ctx.sessions.insert(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
+                    }
+                    ServerMessage::ConnectionClosed { connection_id } => {
+                        active_connections.remove(&connection_id);
+                        event_sinks.retain(|(sink_connection_id, _)| *sink_connection_id != connection_id);
+                        if active_connections.is_empty() {
+                            cleanup_after_all_clients_disconnected(
+                                ctx,
+                                intercepted_paused,
+                                "last_client_disconnected_during_navigation",
+                            ).await;
+                        }
                     }
                     ServerMessage::Cdp(msg) => {
                         let handled_fetch_resolution = msg.text.contains("Fetch.")
@@ -849,6 +897,92 @@ async fn process_with_interception(
     if let Ok(json) = serde_json::to_string(&stop_event) {
         let _ = reply_tx.send(json);
     }
+}
+
+async fn cleanup_after_all_clients_disconnected(
+    ctx: &mut CdpContext,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
+    reason: &str,
+) {
+    let pages_before = ctx.pages.len();
+    let sessions_before = ctx.sessions.len();
+    let pending_events_before = ctx.pending_events.len();
+    let response_bodies_before = ctx.network_response_bodies.lock().await.len();
+    let rss_before_kib = current_rss_kib();
+
+    for mut page in ctx.pages.drain(..) {
+        page.suspend_js();
+    }
+    ctx.sessions.clear();
+    ctx.pending_events.clear();
+    ctx.preload_scripts.clear();
+    ctx.isolated_worlds.clear();
+    ctx.default_context.cookie_jar.clear();
+    ctx.fetch_intercept.enabled = false;
+    ctx.fetch_intercept.patterns.clear();
+    for (_, paused) in ctx.fetch_intercept.paused.drain() {
+        let _ = paused
+            .resolver
+            .send(crate::domains::fetch::FetchResolution::Continue {
+                url: None,
+                method: None,
+                headers: None,
+                post_data: None,
+            });
+    }
+    for (_, resolver) in intercepted_paused.drain() {
+        let _ = resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None,
+            method: None,
+            headers: None,
+            body: None,
+        });
+    }
+    ctx.network_response_bodies.lock().await.clear();
+
+    tracing::info!(
+        target: "obscura::cdp_state",
+        reason,
+        pages_before,
+        sessions_before,
+        pending_events_before,
+        response_bodies_before,
+        rss_before_kib = ?rss_before_kib,
+        rss_after_kib = ?current_rss_kib(),
+        "Cleaned CDP client state after disconnect"
+    );
+}
+
+async fn log_cdp_state(ctx: &CdpContext, event: &str, active_cdp_clients: usize) {
+    let response_body_count = ctx.network_response_bodies.lock().await.len();
+    tracing::info!(
+        target: "obscura::cdp_state",
+        event,
+        active_cdp_clients,
+        active_pages = ctx.pages.len(),
+        active_sessions = ctx.sessions.len(),
+        pending_events = ctx.pending_events.len(),
+        preload_scripts = ctx.preload_scripts.len(),
+        isolated_worlds = ctx.isolated_worlds.len(),
+        fetch_intercept_enabled = ctx.fetch_intercept.enabled,
+        fetch_paused = ctx.fetch_intercept.paused.len(),
+        response_body_count,
+        rss_kib = ?current_rss_kib(),
+        "CDP state snapshot"
+    );
+}
+
+fn current_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
 }
 
 async fn process_cdp_message(
@@ -1022,6 +1156,7 @@ fn check_pending_navigation(
 async fn handle_connection(
     stream: TcpStream,
     port: u16,
+    connection_id: u64,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 4];
@@ -1051,6 +1186,7 @@ async fn handle_connection(
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
 
     let _ = msg_tx.send(ServerMessage::NewConnection {
+        connection_id,
         reply_tx: reply_tx.clone(),
     });
     if let Some(init_msg) = reply_rx.recv().await {
@@ -1107,6 +1243,7 @@ async fn handle_connection(
     }
 
     send_task.abort();
+    let _ = msg_tx.send(ServerMessage::ConnectionClosed { connection_id });
     Ok(())
 }
 
@@ -1260,6 +1397,41 @@ mod tests {
 
         let response = reply_rx.try_recv().expect("CDP response should be sent");
         assert!(response.contains("\"id\":9"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_cleanup_clears_client_state() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions.insert("session-1".to_string(), page_id);
+        ctx.pending_events.push(crate::types::CdpEvent::new(
+            "Target.targetCreated",
+            json!({}),
+        ));
+        ctx.preload_scripts
+            .push(("script-1".to_string(), "window.__x = 1".to_string()));
+        ctx.isolated_worlds.push("utility".to_string());
+        ctx.fetch_intercept.enabled = true;
+        ctx.fetch_intercept.patterns.push("*".to_string());
+        ctx.network_response_bodies.lock().await.insert(
+            "request-1".to_string(),
+            dispatch::NetworkResponseBody {
+                body: "large response".to_string(),
+                base64_encoded: false,
+            },
+        );
+
+        let mut intercepted_paused = HashMap::new();
+        cleanup_after_all_clients_disconnected(&mut ctx, &mut intercepted_paused, "test").await;
+
+        assert!(ctx.pages.is_empty());
+        assert!(ctx.sessions.is_empty());
+        assert!(ctx.pending_events.is_empty());
+        assert!(ctx.preload_scripts.is_empty());
+        assert!(ctx.isolated_worlds.is_empty());
+        assert!(!ctx.fetch_intercept.enabled);
+        assert!(ctx.fetch_intercept.patterns.is_empty());
+        assert!(ctx.network_response_bodies.lock().await.is_empty());
     }
 
     #[test]

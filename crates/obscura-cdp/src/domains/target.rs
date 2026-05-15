@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -191,7 +193,70 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
             Ok(json!({ "browserContextId": ctx.default_context.id }))
         }
         "disposeBrowserContext" => {
+            let browser_context_id = params
+                .get("browserContextId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&ctx.default_context.id);
+            let mut removed_page_ids = HashSet::new();
+            let pages_before = ctx.pages.len();
+
+            let mut retained_pages = Vec::with_capacity(ctx.pages.len());
+            for mut page in ctx.pages.drain(..) {
+                if page.context.id == browser_context_id {
+                    removed_page_ids.insert(page.id.clone());
+                    page.suspend_js();
+                } else {
+                    retained_pages.push(page);
+                }
+            }
+            ctx.pages = retained_pages;
+
+            let detached_sessions = ctx
+                .sessions
+                .iter()
+                .filter_map(|(session_id, page_id)| {
+                    removed_page_ids
+                        .contains(page_id)
+                        .then_some((session_id.clone(), page_id.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (session_id, page_id) in &detached_sessions {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.detachedFromTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetId": page_id,
+                    }),
+                ));
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetDestroyed",
+                    json!({ "targetId": page_id }),
+                ));
+            }
+            ctx.sessions
+                .retain(|_, page_id| !removed_page_ids.contains(page_id));
             ctx.default_context.cookie_jar.clear();
+            ctx.network_response_bodies.lock().await.clear();
+            ctx.fetch_intercept.enabled = false;
+            ctx.fetch_intercept.patterns.clear();
+            for (_, paused) in ctx.fetch_intercept.paused.drain() {
+                let _ = paused
+                    .resolver
+                    .send(super::fetch::FetchResolution::Continue {
+                        url: None,
+                        method: None,
+                        headers: None,
+                        post_data: None,
+                    });
+            }
+            tracing::info!(
+                target: "obscura::cdp_state",
+                browser_context_id,
+                pages_before,
+                pages_after = ctx.pages.len(),
+                response_bodies_cleared = true,
+                "Disposed browser context"
+            );
             Ok(json!({}))
         }
         "getTargetInfo" => {
@@ -261,5 +326,43 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Target method"));
+    }
+
+    #[tokio::test]
+    async fn dispose_browser_context_removes_pages_sessions_and_cached_bodies() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions
+            .insert("browser-session".to_string(), "browser".to_string());
+        ctx.sessions
+            .insert("page-session".to_string(), page_id.clone());
+        ctx.network_response_bodies.lock().await.insert(
+            "request-1".to_string(),
+            crate::dispatch::NetworkResponseBody {
+                body: "large response".to_string(),
+                base64_encoded: false,
+            },
+        );
+
+        handle(
+            "disposeBrowserContext",
+            &json!({"browserContextId": ctx.default_context.id}),
+            &mut ctx,
+        )
+        .await
+        .expect("disposeBrowserContext should succeed");
+
+        assert!(ctx.pages.is_empty());
+        assert_eq!(
+            ctx.sessions.get("browser-session").map(String::as_str),
+            Some("browser")
+        );
+        assert!(!ctx.sessions.contains_key("page-session"));
+        assert!(ctx.network_response_bodies.lock().await.is_empty());
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Target.targetDestroyed"
+                && event.params["targetId"] == page_id));
     }
 }
