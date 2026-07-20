@@ -4,38 +4,68 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish
+        required: true
+        default: v0.3.0
 
 permissions:
   contents: write
 
 jobs:
   build:
-    # Build on Ubuntu 22.04 so the Linux release binary works on common
-    # LTS servers with glibc 2.35 instead of requiring the newer glibc
-    # shipped by ubuntu-latest.
-    runs-on: ubuntu-22.04
-
-    env:
-      TARGET: x86_64-unknown-linux-gnu
-      ARTIFACT_NAME: obscura-x86_64-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: obscura-x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: obscura-aarch64-linux
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ env.TARGET }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          cd target/${{ env.TARGET }}/release
-          tar czf ../../../${{ env.ARTIFACT_NAME }}.tar.gz obscura obscura-worker
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact_name }}.tar.gz obscura obscura-worker
           cd ../../..
+          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
 
-      - name: Upload
+      - name: Stage release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: release
+
+      - name: Upload GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARTIFACT_NAME }}.tar.gz
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: release/*
