@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -10,6 +11,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
+
+use crate::identity::parse_upgrade_context;
 
 use crate::dispatch::{self, CdpContext};
 
@@ -50,11 +53,20 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
+const INVALID_CONTEXT_RESPONSE: &str = "HTTP/1.1 400 Bad Request\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Content-Length: 23\r\nConnection: close\r\n\r\n\
+    invalid browser context";
 use crate::types::CdpRequest;
 
 struct CdpMessage {
     text: String,
     reply_tx: mpsc::UnboundedSender<String>,
+}
+
+struct AcceptedConnection {
+    stream: std::net::TcpStream,
+    identity: Option<obscura_browser::BrowserIdentity>,
 }
 
 enum ServerMessage {
@@ -196,7 +208,7 @@ pub async fn start_with_serve_options_and_limit(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    let (ws_tx, mut ws_rx) = mpsc::channel::<AcceptedConnection>(MAX_PENDING_WS_HANDOFFS);
 
     // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -215,7 +227,7 @@ pub async fn start_with_serve_options_and_limit(
                 }
                 match stream {
                     Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                        if let Err(e) = accept_dispatch(stream, port, stealth, &ws_tx) {
                             if !format!("{}", e).contains("close") {
                                 error!("Accept dispatch error: {}", e);
                             }
@@ -312,10 +324,11 @@ pub async fn start_with_serve_options_and_limit(
             stream = ws_rx.recv() => stream,
             _ = shutdown_notify.notified() => None,
         };
-        let stream = match stream {
+        let accepted = match stream {
             Some(s) => s,
             None => break,
         };
+        let AcceptedConnection { stream, identity } = accepted;
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -351,6 +364,7 @@ pub async fn start_with_serve_options_and_limit(
             persistence_lock.clone(),
             shutdown_notify.clone(),
             live_connections.clone(),
+            identity,
         );
     }
 
@@ -439,6 +453,7 @@ fn run_connection(
     persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown_notify: Arc<Notify>,
     live_connections: Arc<AtomicUsize>,
+    identity: Option<obscura_browser::BrowserIdentity>,
 ) {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
@@ -456,9 +471,20 @@ fn run_connection(
         .name("obscura-cdp-conn".into())
         .spawn(move || {
             let _slot = SlotGuard(slot);
-            let default_context = Arc::new(
-                context_template.isolated_copy("default".to_string(), true),
-            );
+            let default_context = match identity.as_ref() {
+                Some(identity) => match context_template.isolated_copy_with_identity(
+                    "default".to_string(),
+                    true,
+                    identity,
+                ) {
+                    Ok(context) => Arc::new(context),
+                    Err(_) => {
+                        error!("connection identity rejected");
+                        return;
+                    }
+                },
+                None => Arc::new(context_template.isolated_copy("default".to_string(), true)),
+            };
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -596,8 +622,47 @@ fn refuse_connection(stream: std::net::TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
+fn reject_invalid_context(stream: std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let mut stream = stream;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    let mut request = [0u8; HTTP_PEEK_BUF];
+    let _ = stream.read(&mut request);
+    let _ = stream.write_all(INVALID_CONTEXT_RESPONSE.as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
 const HTTP_PEEK_BUF: usize = 4096;
 const WS_PEEK_BUF: usize = 4;
+const HTTP_HEADER_WAIT: Duration = Duration::from_millis(100);
+
+fn has_http_header_end(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"\r\n\r\n")
+}
+
+/// Peek a bounded HTTP upgrade without consuming bytes. TCP may expose the
+/// request in fragments even when the client writes one logical handshake.
+fn peek_upgrade_headers(
+    stream: &std::net::TcpStream,
+) -> std::io::Result<(usize, [u8; HTTP_PEEK_BUF])> {
+    let deadline = Instant::now() + HTTP_HEADER_WAIT;
+    let mut request = [0u8; HTTP_PEEK_BUF];
+
+    loop {
+        let received = stream.peek(&mut request)?;
+        if received == HTTP_PEEK_BUF
+            || has_http_header_end(&request[..received])
+            || Instant::now() >= deadline
+        {
+            return Ok((received, request));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
+}
 
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
@@ -609,14 +674,15 @@ const WS_PEEK_BUF: usize = 4;
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    stealth: bool,
+    ws_tx: &mpsc::Sender<AcceptedConnection>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
     let n = stream.peek(&mut buf)?;
 
+    let mut identity = None;
     if n >= 4 && &buf == b"GET " {
-        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
-        let n = stream.peek(&mut peek_buf)?;
+        let (n, peek_buf) = peek_upgrade_headers(&stream)?;
         let line = String::from_utf8_lossy(&peek_buf[..n]);
 
         let endpoint = if line.contains("/json/version") {
@@ -632,6 +698,20 @@ fn accept_dispatch(
         if let Some(ep) = endpoint {
             return handle_http_json_blocking(stream, port, ep);
         }
+
+        let complete = has_http_header_end(&peek_buf[..n]);
+        if complete {
+            match parse_upgrade_context(&peek_buf[..n], stealth) {
+                Ok(parsed) => identity = parsed,
+                Err(_) => {
+                    reject_invalid_context(stream);
+                    return Ok(());
+                }
+            }
+        } else {
+            reject_invalid_context(stream);
+            return Ok(());
+        }
         // Fall through: GET request that isn't a /json endpoint → treat as
         // WebSocket upgrade (Chromium DevTools clients issue GET with
         // Upgrade: websocket).
@@ -644,7 +724,7 @@ fn accept_dispatch(
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
     ws_tx
-        .try_send(stream)
+        .try_send(AcceptedConnection { stream, identity })
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
@@ -1614,7 +1694,8 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        handle_fetch_resolution, has_http_header_end, is_navigate_method, merge_cookie_delta,
+        parse_cdp_headers, peek_upgrade_headers,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -1633,6 +1714,51 @@ mod tests {
             same_site: "Lax".to_string(),
             expires: None,
         }
+    }
+
+    #[test]
+    fn fragmented_upgrade_is_peeked_until_complete() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            peek_upgrade_headers(&stream).unwrap()
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /devtools/browser HTTP/1.1\r\nX-Obscura-Con")
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+        client.write_all(b"text: ignored\r\n\r\n").unwrap();
+
+        let (received, request) = server.join().unwrap();
+        assert!(has_http_header_end(&request[..received]));
+    }
+
+    #[test]
+    fn incomplete_upgrade_times_out_without_being_ready() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            peek_upgrade_headers(&stream).unwrap()
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"GET /devtools/browser HTTP/1.1\r\n").unwrap();
+
+        let (received, request) = server.join().unwrap();
+        assert!(!has_http_header_end(&request[..received]));
     }
 
     #[tokio::test(flavor = "current_thread")]
