@@ -1447,8 +1447,11 @@ impl Page {
                 &self.context.ua_platform_version,
             );
         }
-        if let Some((lat, lon)) = env_geolocation() {
+        if let Some((lat, lon)) = self.context.geolocation.or_else(env_geolocation) {
             rt.set_geolocation(lat, lon);
+        }
+        if let Some(seed) = self.context.fingerprint_seed.as_deref() {
+            rt.set_fingerprint_seed(seed);
         }
         rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
         rt.set_screen_size_override(

@@ -528,7 +528,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 8] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -536,6 +536,7 @@ impl ObscuraJsRuntime {
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
+            "__obscura_fingerprint_seed",
         ];
 
         let main = self.runtime.main_context();
@@ -1435,6 +1436,20 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_geo_lat={};globalThis.__obscura_geo_lon={};",
                 latitude, longitude
             ),
+        );
+    }
+
+    /// Set the stable fingerprint seed for this document. Only a stable hash
+    /// crosses into JS; the caller's seed is never exposed to page code.
+    pub fn set_fingerprint_seed(&mut self, seed: &str) {
+        let mut hash = 2_166_136_261_u32;
+        for byte in seed.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        let _ = self.execute_runtime_script(
+            "<set-fingerprint-seed>",
+            format!("globalThis.__obscura_fingerprint_seed={hash};"),
         );
     }
 
@@ -9642,6 +9657,22 @@ mod tests {
                 .unwrap(),
             serde_json::json!([2560, 1440, 1])
         );
+    }
+
+    #[test]
+    fn explicit_fingerprint_seed_is_stable_across_runtime_recreation() {
+        fn fingerprint(seed: &str) -> serde_json::Value {
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(parse_html("<html><body></body></html>"));
+            rt.set_fingerprint_seed(seed);
+            rt.run_page_init();
+            rt.evaluate("[screen.width, screen.height, navigator.hardwareConcurrency, navigator.deviceMemory, new AudioContext().sampleRate]")
+                .unwrap()
+        }
+
+        let first = fingerprint("stable-seed");
+        assert_eq!(first, fingerprint("stable-seed"));
+        assert_ne!(first, fingerprint("different-seed"));
     }
 
     #[cfg(feature = "render")]

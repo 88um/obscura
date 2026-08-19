@@ -3,6 +3,19 @@ use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
+/// Per-CDP-connection browser identity. Values are validated before a
+/// connection is constructed; this type intentionally has no `Debug` impl so
+/// credentials and fingerprint seeds cannot enter formatted diagnostics.
+#[derive(Clone)]
+pub struct BrowserIdentity {
+    pub fingerprint_seed: String,
+    pub browser_profile: String,
+    pub operating_system: String,
+    pub proxy_url: Option<String>,
+    pub timezone: Option<String>,
+    pub geolocation: Option<(f64, f64)>,
+}
+
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
@@ -30,6 +43,12 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+    /// Present only when this context came from an explicit CDP identity.
+    pub fingerprint_seed: Option<String>,
+    pub browser_profile: Option<String>,
+    pub operating_system: Option<String>,
+    pub timezone: Option<String>,
+    pub geolocation: Option<(f64, f64)>,
 }
 
 impl BrowserContext {
@@ -133,6 +152,11 @@ impl BrowserContext {
             allow_file_access: false,
             storage_dir,
             allow_private_network,
+            fingerprint_seed: None,
+            browser_profile: None,
+            operating_system: None,
+            timezone: None,
+            geolocation: None,
         }
     }
 
@@ -151,6 +175,52 @@ impl BrowserContext {
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {
         Self::with_options(id, proxy_url, false)
+    }
+
+    /// Clone a context for a CDP connection and apply its validated identity.
+    /// The cookie jar and HTTP client remain isolated from the template while
+    /// the identity itself is inherited by contexts cloned from this result.
+    pub fn isolated_copy_with_identity(
+        &self,
+        id: String,
+        persistent: bool,
+        identity: &BrowserIdentity,
+    ) -> Result<Self, String> {
+        let profile = crate::profiles::profile_for_name(&identity.browser_profile)
+            .ok_or_else(|| "unsupported browser identity".to_string())?;
+        if identity.operating_system != "windows" {
+            return Err("unsupported browser identity".to_string());
+        }
+
+        let mut context = self.isolated_copy(id, persistent);
+        let proxy_url = identity
+            .proxy_url
+            .clone()
+            .or_else(|| self.proxy_url.clone());
+        let mut client = ObscuraHttpClient::with_full_options(
+            context.cookie_jar.clone(),
+            proxy_url.as_deref(),
+            context.allow_private_network,
+        );
+        if context.stealth {
+            client.block_trackers = true;
+        }
+        if let Ok(mut guard) = client.user_agent.try_write() {
+            *guard = profile.user_agent.to_string();
+        }
+
+        context.http_client = Arc::new(client);
+        context.user_agent = profile.user_agent.to_string();
+        context.platform = profile.platform.to_string();
+        context.ua_platform = profile.ua_platform.to_string();
+        context.ua_platform_version = profile.ua_platform_version.to_string();
+        context.proxy_url = proxy_url;
+        context.fingerprint_seed = Some(identity.fingerprint_seed.clone());
+        context.browser_profile = Some(identity.browser_profile.clone());
+        context.operating_system = Some(identity.operating_system.clone());
+        context.timezone = identity.timezone.clone();
+        context.geolocation = identity.geolocation;
+        Ok(context)
     }
 
     /// Create a context with the same browser configuration but independent
@@ -190,6 +260,11 @@ impl BrowserContext {
             allow_file_access: self.allow_file_access,
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
             allow_private_network: self.allow_private_network,
+            fingerprint_seed: self.fingerprint_seed.clone(),
+            browser_profile: self.browser_profile.clone(),
+            operating_system: self.operating_system.clone(),
+            timezone: self.timezone.clone(),
+            geolocation: self.geolocation,
         }
     }
 
@@ -265,5 +340,37 @@ mod tests {
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
         assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_is_cloned_with_proxy_and_context_scoped_values() {
+        let template = BrowserContext::with_options(
+            "template".to_string(),
+            Some("http://template.example:8080".to_string()),
+            false,
+        );
+        let identity = BrowserIdentity {
+            fingerprint_seed: "stable-seed".to_string(),
+            browser_profile: "chrome_145".to_string(),
+            operating_system: "windows".to_string(),
+            proxy_url: Some("http://user:secret@example.test:8080".to_string()),
+            timezone: None,
+            geolocation: Some((41.0, -87.0)),
+        };
+        let context = template
+            .isolated_copy_with_identity("connection".to_string(), true, &identity)
+            .unwrap();
+        assert_eq!(context.fingerprint_seed.as_deref(), Some("stable-seed"));
+        assert_eq!(context.browser_profile.as_deref(), Some("chrome_145"));
+        assert_eq!(context.geolocation, Some((41.0, -87.0)));
+        assert_eq!(
+            context.http_client.proxy_url(),
+            identity.proxy_url.as_deref()
+        );
+
+        let cloned = context.isolated_copy("cloned".to_string(), false);
+        assert_eq!(cloned.fingerprint_seed, context.fingerprint_seed);
+        assert_eq!(cloned.proxy_url, context.proxy_url);
+        assert_eq!(cloned.geolocation, context.geolocation);
     }
 }

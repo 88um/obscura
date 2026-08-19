@@ -143,6 +143,7 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    proxy_configured: bool,
 }
 
 #[cfg(feature = "stealth")]
@@ -209,7 +210,14 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            proxy_configured: proxy_url.is_some(),
         }
+    }
+
+    /// Whether this client was built with a per-context upstream proxy.
+    /// This deliberately exposes only presence, never the proxy URL.
+    pub fn has_proxy(&self) -> bool {
+        self.proxy_configured
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -504,6 +512,17 @@ mod tests {
         0x00,
     ];
 
+    #[test]
+    fn proxy_configuration_is_present_without_exposing_url() {
+        let client = StealthHttpClient::with_proxy(
+            Arc::new(CookieJar::new()),
+            Some("http://user:secret@example.test:8080"),
+        );
+        assert!(client.has_proxy());
+        let direct = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        assert!(!direct.has_proxy());
+    }
+
     fn reset_fixture(respond_after_reset: bool) -> (u16, std::thread::JoinHandle<usize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -563,6 +582,7 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            proxy_configured: false,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

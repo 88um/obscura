@@ -2047,7 +2047,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .tcp_keepalive(std::time::Duration::from_secs(60));
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
-            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
+            .map_err(|_| "invalid request proxy configuration".to_string())?;
         builder = builder.proxy(p);
     }
     builder
@@ -2903,7 +2903,10 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        build_request_client, cors_response_allows, glob_match, validate_fetch_url,
+        FetchCredentials,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -2938,6 +2941,14 @@ mod tests {
             "*://*.gstatic.com/*.woff2",
             "https://fonts.gstatic.com/s/inter/v18/font.woff",
         ));
+    }
+
+    #[test]
+    fn invalid_proxy_errors_are_redacted() {
+        let error = build_request_client(Some("http://user:secret@["))
+            .expect_err("malformed proxy must be rejected");
+        assert_eq!(error, "invalid request proxy configuration");
+        assert!(!error.contains("secret"));
     }
 
     #[test]

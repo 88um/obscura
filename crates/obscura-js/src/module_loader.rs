@@ -239,9 +239,9 @@ impl ModuleLoader for ObscuraModuleLoader {
             // graphs without losing descendant fetches of a lazy graph.
             let _activity_guard = activity_guard;
             tracing::debug!(
-                "Loading ES module: {} (proxy: {})",
+                "Loading ES module: {} (proxy configured: {})",
                 url,
-                proxy_url.as_deref().unwrap_or("direct")
+                proxy_url.is_some()
             );
 
             match page_network {

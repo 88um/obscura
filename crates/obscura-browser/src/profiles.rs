@@ -1,4 +1,5 @@
 pub struct BrowserProfile {
+    pub name: &'static str,
     pub user_agent: &'static str,
     pub platform: &'static str,
     pub ua_platform: &'static str,
@@ -7,54 +8,73 @@ pub struct BrowserProfile {
 
 pub static PROFILES: &[BrowserProfile] = &[
     BrowserProfile {
+        name: "chrome_143_windows",
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
         platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "10.0.0",
     },
     BrowserProfile {
+        name: "chrome_144_windows",
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "10.0.0",
     },
     BrowserProfile {
+        name: "chrome_145_windows",
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
         platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "15.0.0",
     },
     BrowserProfile {
+        name: "chrome_146_windows",
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "15.0.0",
     },
     BrowserProfile {
+        name: "chrome_143_macos",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
         platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "13.6.7",
     },
     BrowserProfile {
+        name: "chrome_144_macos",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.4.1",
     },
     BrowserProfile {
+        name: "chrome_145_macos",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
         platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.5.0",
     },
     BrowserProfile {
+        name: "chrome_146_macos",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.6.0",
     },
 ];
+
+/// Resolve the profile names accepted by the CDP connection identity contract.
+/// The stealth transport currently has only one matching TLS/HTTP profile.
+pub fn profile_for_name(name: &str) -> Option<&'static BrowserProfile> {
+    match name {
+        "chrome_145" => PROFILES
+            .iter()
+            .find(|profile| profile.name == "chrome_145_windows"),
+        _ => None,
+    }
+}
 
 pub fn random_profile() -> &'static BrowserProfile {
     let idx = (std::time::SystemTime::now()
