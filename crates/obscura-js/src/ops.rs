@@ -72,8 +72,9 @@ pub struct StoredNetworkResponseBody {
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
-    /// Network.getResponseBody resolves for the same request.
+    /// Matches the id under which the body is stored, so CDP response-body
+    /// lookups resolve for the same request. Intercepted fetches retain their
+    /// Fetch.requestPaused id; ordinary fetches use a `fetch-{N}` id.
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -2226,8 +2227,10 @@ async fn op_fetch_url(
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<String> = None;
+    let mut interception_request_id: Option<String> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
+        interception_request_id = Some(request_id.clone());
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
@@ -2636,8 +2639,12 @@ async fn op_fetch_url(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
+        let request_id = interception_request_id
+            .take()
+            .unwrap_or_else(|| {
+                gs.network_response_body_counter += 1;
+                format!("fetch-{}", gs.network_response_body_counter)
+            });
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
         if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
