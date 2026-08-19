@@ -187,7 +187,30 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|value| value.as_str())
+                .ok_or("Fetch.getResponseBody requires requestId")?;
+
+            let body = if let Some(page) = ctx.get_session_page(session_id) {
+                page.get_response_body(request_id)
+            } else {
+                ctx.pages
+                    .iter()
+                    .find_map(|page| page.get_response_body(request_id))
+            };
+
+            match body {
+                Some(body) => Ok(json!({
+                    "body": body.body,
+                    "base64Encoded": body.base64_encoded,
+                })),
+                None => Err(format!(
+                    "No response body found for Fetch requestId {request_id}"
+                )),
+            }
+        }
         "takeResponseBodyAsStream" => {
             // Hand the client a streaming handle for a large response body so it
             // can pull it in chunks via IO.read and free it with IO.close,
@@ -220,5 +243,51 @@ pub async fn handle(
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_response_body_returns_cached_page_body() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).expect("page");
+        page.navigate("data:text/html,<html><body>fetch body</body></html>")
+            .await
+            .expect("navigate data URL");
+        let request_id = page.network_events[0].request_id.clone();
+
+        let result = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("Fetch.getResponseBody should return the cached body");
+
+        assert_eq!(result["body"], "<html><body>fetch body</body></html>");
+        assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn get_response_body_errors_for_unknown_request() {
+        let mut ctx = CdpContext::new();
+        let error = handle(
+            "getResponseBody",
+            &json!({ "requestId": "missing" }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("unknown Fetch request should fail");
+
+        assert!(error.contains("missing"));
     }
 }
