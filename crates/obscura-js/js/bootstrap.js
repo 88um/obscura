@@ -2663,6 +2663,14 @@ class NamedNodeMap {
 }
 globalThis.NamedNodeMap = NamedNodeMap;
 
+// The interface `Element.dataset` returns. Scripts brand-check the map with
+// `el.dataset instanceof window.DOMStringMap`, which throws a TypeError when
+// the global is absent, so both the constructor and the prototype link on the
+// dataset proxy are observable.
+class DOMStringMap {}
+_markNative(DOMStringMap);
+globalThis.DOMStringMap = DOMStringMap;
+
 let _waapiNextId = 1;
 const _waapiAnimations = new Set();
 
@@ -4088,7 +4096,7 @@ class Element extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
+    this._dataset = new Proxy(Object.create(DOMStringMap.prototype), {
       get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
       set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
       has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
@@ -6280,6 +6288,88 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
+// Service workers never run here, but the interfaces they hand back must exist:
+// application bundles reference `ServiceWorkerRegistration` unguarded after
+// calling `register()`, and a bare ReferenceError there aborts their bootstrap.
+class _ServiceWorkerEventTarget {
+  constructor() { this._listeners = Object.create(null); }
+  addEventListener(type, listener) {
+    if (typeof listener !== "function") return;
+    (this._listeners[type] || (this._listeners[type] = [])).push(listener);
+  }
+  removeEventListener(type, listener) {
+    const listeners = this._listeners[type];
+    if (listeners) this._listeners[type] = listeners.filter((item) => item !== listener);
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) return true;
+    for (const listener of this._listeners[event.type] || []) {
+      try { listener.call(this, event); } catch (error) { console.error(error); }
+    }
+    const handler = this["on" + event.type];
+    if (typeof handler === "function") {
+      try { handler.call(this, event); } catch (error) { console.error(error); }
+    }
+    return !event.defaultPrevented;
+  }
+}
+
+class ServiceWorker extends _ServiceWorkerEventTarget {
+  constructor(scriptURL = "") {
+    super();
+    this.scriptURL = scriptURL;
+    this.state = "activated";
+    this.onstatechange = null;
+    this.onerror = null;
+  }
+  postMessage() {}
+}
+
+class ServiceWorkerRegistration extends _ServiceWorkerEventTarget {
+  constructor(scope = "/", scriptURL = "") {
+    super();
+    this.scope = scope;
+    this.installing = null;
+    this.waiting = null;
+    this.active = new ServiceWorker(scriptURL);
+    this.updateViaCache = "imports";
+    this.onupdatefound = null;
+  }
+  getNotifications() { return Promise.resolve([]); }
+  showNotification() { return Promise.resolve(); }
+  unregister() { return Promise.resolve(true); }
+  update() { return Promise.resolve(this); }
+}
+
+class ServiceWorkerContainer extends _ServiceWorkerEventTarget {
+  constructor() {
+    super();
+    this.controller = null;
+    this.oncontrollerchange = null;
+    this.onmessage = null;
+    this.onmessageerror = null;
+    this._registrations = [];
+    this.ready = Promise.resolve(new ServiceWorkerRegistration());
+  }
+  register(scriptURL = "", options = {}) {
+    const registration = new ServiceWorkerRegistration(options.scope || "/", String(scriptURL));
+    this._registrations.push(registration);
+    this.ready = Promise.resolve(registration);
+    return Promise.resolve(registration);
+  }
+  getRegistration() { return Promise.resolve(this._registrations[0] || null); }
+  getRegistrations() { return Promise.resolve(this._registrations.slice()); }
+  startMessages() {}
+}
+
+for (const prototype of [_ServiceWorkerEventTarget.prototype, ServiceWorker.prototype,
+  ServiceWorkerRegistration.prototype, ServiceWorkerContainer.prototype]) {
+  for (const name of Object.getOwnPropertyNames(prototype)) _markNative(prototype[name]);
+}
+globalThis.ServiceWorker = ServiceWorker;
+globalThis.ServiceWorkerRegistration = ServiceWorkerRegistration;
+globalThis.ServiceWorkerContainer = ServiceWorkerContainer;
+
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
@@ -6310,7 +6400,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: new ServiceWorkerContainer(),
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -14191,9 +14281,6 @@ if (typeof SharedWorker === 'undefined') {
   globalThis.SharedWorker = class SharedWorker {
     constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
   };
-}
-if (typeof ServiceWorkerContainer === 'undefined') {
-  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
 }
 
 if (typeof URLPattern === 'undefined') {

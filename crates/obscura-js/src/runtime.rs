@@ -15651,6 +15651,96 @@ mod tests {
         );
     }
 
+    /// `Element.dataset` must be branded as a DOMStringMap.
+    /// Regression: Facebook's and Instagram's async resource bootloader gates
+    /// its load observer on `el.dataset instanceof window.DOMStringMap`. With
+    /// the global missing that comparison throws, the observer that marks
+    /// resources loaded is never installed, and the application bundle waits
+    /// forever for scripts it already fetched.
+    #[test]
+    fn dataset_is_branded_as_a_dom_string_map() {
+        let mut rt = setup_runtime("<div id='a' data-bootloader-hash='h1' data-async-css='1'></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.getElementById('a');
+                const branded = (node) =>
+                    node.dataset instanceof window.DOMStringMap ? node.dataset : null;
+                const map = branded(el);
+                el.dataset.printScreenSwap = "1";
+                return {
+                    globalIsCallable: typeof DOMStringMap === 'function',
+                    branded: map !== null,
+                    readsAttribute: map.bootloaderHash,
+                    keys: Object.keys(el.dataset),
+                    writesAttribute: el.getAttribute('data-print-screen-swap'),
+                    plainObjectIsNotBranded: {} instanceof window.DOMStringMap,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "globalIsCallable": true,
+                "branded": true,
+                "readsAttribute": "h1",
+                "keys": ["bootloaderHash", "asyncCss", "printScreenSwap"],
+                "writesAttribute": "1",
+                "plainObjectIsNotBranded": false,
+            })
+        );
+    }
+
+    /// The service worker interfaces must be reachable as bare globals.
+    /// Regression: Instagram's `CometPlatformRootClient.initialize` references
+    /// `ServiceWorkerRegistration` unguarded once `register()` resolves, so a
+    /// missing global raised a ReferenceError that aborted page bootstrap
+    /// before the timeline query was ever issued.
+    #[test]
+    fn service_worker_interfaces_are_defined_globally() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const container = navigator.serviceWorker;
+                const registration = new ServiceWorkerRegistration('/scope', '/sw.js');
+                container.register('/sw.js').then((value) => {
+                    globalThis.__registered = value instanceof ServiceWorkerRegistration
+                        && value.active instanceof ServiceWorker
+                        && value.scope === '/';
+                });
+                return {
+                    containerIsBranded: container instanceof ServiceWorkerContainer,
+                    registrationIsBranded: registration instanceof ServiceWorkerRegistration,
+                    activeWorker: registration.active.scriptURL,
+                    scope: registration.scope,
+                    listens: typeof container.addEventListener,
+                    registerIsThenable: typeof container.register('/sw.js').then,
+                    isNative: Function.prototype.toString.call(container.register).includes('[native code]'),
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "containerIsBranded": true,
+                "registrationIsBranded": true,
+                "activeWorker": "/sw.js",
+                "scope": "/scope",
+                "listens": "function",
+                "registerIsThenable": "function",
+                "isNative": true,
+            })
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__registered").unwrap(),
+            serde_json::json!(true),
+            "register() must resolve with a ServiceWorkerRegistration"
+        );
+    }
+
     #[test]
     fn text_codec_streams_expose_browser_shape() {
         let mut rt = setup_runtime("<div></div>");
