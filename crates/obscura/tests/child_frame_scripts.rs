@@ -47,6 +47,17 @@ const STATIC_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</ti
 <iframe src="/child.html"></iframe>
 </body></html>"#;
 
+const DATA_SCRIPT_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
+<iframe src="/child-data-script.html"></iframe>
+</body></html>"#;
+
+/// Meta properties ship a frame's bootstrap as `<script src="data:...">`, in
+/// both the base64 and percent-encoded forms `decode_data_uri` accepts.
+const DATA_SCRIPT_CHILD_HTML: &str = r#"<!doctype html><html><head><title>BEFORE</title></head><body>
+<script src="data:application/x-javascript;base64,d2luZG93Ll9fZnJvbUJhc2U2NCA9ICJZRVMiOyBkb2N1bWVudC50aXRsZSA9ICJSQU4tRlJPTS1EQVRBLVVSTCI7"></script>
+<script src="data:text/javascript,window.__fromPlain%20%3D%20%22YES%22%3B"></script>
+</body></html>"#;
+
 const CHILD_HTML: &str = r#"<!doctype html><html><head><title>BEFORE</title></head><body>
 <p>child</p>
 <script>
@@ -98,6 +109,8 @@ fn spawn_server(parent_html: &'static str) -> String {
                 CHILD_HTML
             } else if buf[..read].starts_with(b"GET /child-messaging.html ") {
                 MESSAGING_CHILD_HTML
+            } else if buf[..read].starts_with(b"GET /child-data-script.html ") {
+                DATA_SCRIPT_CHILD_HTML
             } else {
                 parent_html
             };
@@ -350,4 +363,41 @@ async fn changing_iframe_src_releases_the_previous_realm() {
             "old iframe stayed in {registry}",
         );
     }
+}
+
+/// A frame's `<script src="data:...">` carries its bytes inline. The document
+/// script path decoded those locally, but the frame path handed them to the
+/// network client, which rejects the scheme, so every such script failed with
+/// "Forbidden URL scheme 'data'" and the frame's bootstrap never ran.
+#[tokio::test]
+async fn a_child_frame_runs_a_data_url_script() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(DATA_SCRIPT_PARENT_HTML);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.settle(2000).await;
+
+    assert_eq!(
+        page.frame_urls(),
+        vec![format!("{base}/child-data-script.html")],
+        "the child document never became a frame"
+    );
+    assert_eq!(
+        page.evaluate_in_frame(0, "window.__fromBase64").unwrap(),
+        serde_json::json!("YES"),
+        "a base64 data: script did not run in the frame"
+    );
+    assert_eq!(
+        page.evaluate_in_frame(0, "window.__fromPlain").unwrap(),
+        serde_json::json!("YES"),
+        "a percent-encoded data: script did not run in the frame"
+    );
+    // Written by the data: script, over the child's static <title>.
+    assert_eq!(
+        page.evaluate_in_frame(0, "document.title").unwrap(),
+        serde_json::json!("RAN-FROM-DATA-URL"),
+    );
+    assert_eq!(page.evaluate("window.__fromBase64"), serde_json::Value::Null);
 }

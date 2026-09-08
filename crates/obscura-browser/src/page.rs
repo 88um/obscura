@@ -1026,6 +1026,19 @@ impl Page {
                 if self.should_block_url(&url) {
                     continue;
                 }
+                // A data: script carries its bytes inline, so it is decoded here
+                // rather than handed to the network client, which rejects the
+                // scheme. The document script path above does the same; Meta
+                // properties serve frame bootstrap this way.
+                if parsed.scheme() == "data" {
+                    match decode_data_uri(&url) {
+                        Some(body) => {
+                            sources.insert(url, String::from_utf8_lossy(&body).into_owned());
+                        }
+                        None => tracing::warn!("frame script {} is not a valid data URL", url),
+                    }
+                    continue;
+                }
                 match self.do_fetch(&parsed).await {
                     Ok(response) => {
                         sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
