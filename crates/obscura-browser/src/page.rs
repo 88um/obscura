@@ -191,6 +191,7 @@ fn escape_for_js_template_literal(input: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
+    pub post_data: Option<String>,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -3555,7 +3556,8 @@ impl Page {
                 method: ev.method,
                 resource_type: "Fetch".to_string(),
                 status: ev.status,
-                headers: std::collections::HashMap::new(),
+                headers: ev.request_headers,
+                post_data: ev.post_data,
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
@@ -3845,6 +3847,7 @@ impl Page {
             url: url.to_string(),
             method: method.to_string(),
             resource_type: resource_type.to_string(),
+            post_data: None,
             status,
             headers: std::collections::HashMap::new(),
             response_headers: Arc::new(response_headers.clone()),

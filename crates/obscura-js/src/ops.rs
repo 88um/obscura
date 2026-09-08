@@ -79,6 +79,8 @@ pub struct JsNetworkEvent {
     pub url: String,
     pub method: String,
     pub status: u16,
+    pub request_headers: HashMap<String, String>,
+    pub post_data: Option<String>,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
@@ -435,20 +437,6 @@ fn propagate_script_start_state(
     }
     drop(current);
     started.borrow_mut().extend(additions);
-}
-
-fn response_body_entry_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
-}
-
-fn response_body_byte_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024)
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
@@ -2420,7 +2408,10 @@ async fn op_fetch_url(
             client
         };
         if let Some(stealth) = stealth {
+            let shared_state = state.borrow().borrow::<SharedState>().clone();
             return stealth_fetch_all(
+                shared_state,
+                interception_request_id,
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -2442,7 +2433,7 @@ async fn op_fetch_url(
     // (GHSA-8v6v-g4rh-jmcm).
     let mut current_url = url.clone();
     let mut current_method = req_method;
-    let mut current_body = body;
+    let mut current_body = body.clone();
     let mut redirects_followed: usize = 0;
     let response = loop {
         let mut req = client
@@ -2635,57 +2626,20 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let request_id = interception_request_id
-            .take()
-            .unwrap_or_else(|| {
-                gs.network_response_body_counter += 1;
-                format!("fetch-{}", gs.network_response_body_counter)
-            });
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
+    let shared_state = state.borrow().borrow::<SharedState>().clone();
+    let response_request_id = crate::scripted_response::record_scripted_response(
+        &shared_state,
+        interception_request_id,
+        crate::scripted_response::ScriptedResponse {
+            url: &url,
+            method: &method,
+            request_headers: &custom_headers,
+            request_body: &body,
             status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+            headers: &resp_headers,
+            body: &resp_bytes,
+        },
+    );
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -2727,10 +2681,11 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Both transports share CDP event and response-body recording.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
+    state: SharedState,
+    interception_request_id: Option<String>,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -2743,8 +2698,8 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
-    let mut current_method = method;
-    let mut current_body = body;
+    let mut current_method = method.clone();
+    let mut current_body = body.clone();
     let mut redirects_followed: usize = 0;
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
@@ -2864,10 +2819,25 @@ async fn stealth_fetch_all(
         }
     }
 
+    let response_request_id = crate::scripted_response::record_scripted_response(
+        &state,
+        interception_request_id,
+        crate::scripted_response::ScriptedResponse {
+            url: &url,
+            method: &method,
+            request_headers: &custom_headers,
+            request_body: &body,
+            status,
+            headers: &resp_headers,
+            body: &resp_bytes,
+        },
+    );
+
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": response_request_id,
         "url": url,
         "headers": resp_headers,
     })

@@ -2020,6 +2020,7 @@ mod tests {
             .network_events
             .push(obscura_browser::NetworkEvent {
                 request_id: "probe-1".to_string(),
+                post_data: None,
                 url: "https://example.test/probe.json".to_string(),
                 method: "GET".to_string(),
                 resource_type: "Fetch".to_string(),

@@ -5,6 +5,7 @@ pub mod markdown;
 pub mod module_loader;
 pub mod ops;
 pub mod runtime;
+mod scripted_response;
 pub mod v8_flags;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
