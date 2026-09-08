@@ -1061,22 +1061,29 @@ async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String>
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
-            .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
+    let Some((page_id, frame_id, page_url)) = ctx
+        .pages
+        .iter()
+        .find(|page| page.has_js())
+        .map(|page| (page.id.clone(), page.frame_id.clone(), page.url_string()))
+    else {
         return;
     };
+    // A page can carry its managed session and one or more flattened
+    // attachments at the same time, and `sessions` is a HashMap, so picking the
+    // first match sends these events to an arbitrary one. A client listening on
+    // any other session then never sees the fetch and XHR traffic its page
+    // made, which is how `page.on('response')` went quiet for everything except
+    // the navigation itself. Report to every session bound to the page.
+    let session_ids: Vec<Option<String>> = ctx
+        .sessions
+        .iter()
+        .filter(|(_, bound)| *bound == &page_id)
+        .map(|(session_id, _)| Some(session_id.clone()))
+        .collect();
+    if session_ids.is_empty() {
+        return;
+    }
     let network_events = {
         let Some(page) = ctx.get_page_mut(&page_id) else {
             return;
@@ -1084,14 +1091,19 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
         page.sync_js_network_events();
         page.network_events.drain(..).collect::<Vec<_>>()
     };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+    if network_events.is_empty() {
+        return;
+    }
+    for session_id in &session_ids {
+        crate::domains::page::emit_runtime_network_events(
+            ctx,
+            session_id,
+            &frame_id,
+            &page_url,
+            &page_id,
+            &network_events,
+        );
+    }
 }
 
 fn take_live_pending_navigation(
@@ -1970,6 +1982,74 @@ mod tests {
             serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
         assert_eq!(response["id"], 17);
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+    }
+
+    /// A page's JS-initiated requests must reach every session attached to it.
+    ///
+    /// `js_fetch_emits_network_events` covers generation. This covers delivery:
+    /// the autonomous pump picked one session out of a `HashMap`, so a page
+    /// holding both its managed session and a client's flattened attachment
+    /// reported fetch and XHR traffic to whichever iterated first. Playwright
+    /// and Puppeteer attach flattened, so `page.on('response')` saw the
+    /// navigation and nothing else, and waiting on an XHR response hung until
+    /// it timed out even though the request had already succeeded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn js_network_events_reach_every_session_attached_to_the_page() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let managed = format!("{page_id}-session");
+        let flattened = format!("{page_id}-flattened-1");
+        ctx.sessions.insert(managed.clone(), page_id.clone());
+        ctx.sessions.insert(flattened.clone(), page_id.clone());
+        let session = Some(managed.clone());
+
+        // The page needs a live runtime for the pump to consider it, but the
+        // event itself is injected so the test stays offline and deterministic.
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": "data:text/html,<p>network</p>", "waitUntil": "load"}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate fixture");
+        ctx.pending_events.clear();
+
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .network_events
+            .push(obscura_browser::NetworkEvent {
+                request_id: "probe-1".to_string(),
+                url: "https://example.test/probe.json".to_string(),
+                method: "GET".to_string(),
+                resource_type: "Fetch".to_string(),
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
+                body_size: 12,
+                timestamp: 1.0,
+            });
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        super::sync_live_page_network_events(&mut ctx);
+        super::forward_pending_events(&mut ctx, Some(&reply_tx));
+
+        let mut notified = Vec::new();
+        while let Ok(raw) = reply_rx.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if event["method"] == "Network.responseReceived"
+                && event["params"]["response"]["url"] == "https://example.test/probe.json"
+            {
+                notified.push(event["sessionId"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        notified.sort();
+        let mut expected = vec![managed, flattened];
+        expected.sort();
+        assert_eq!(
+            notified, expected,
+            "every session attached to the page must be told about its own requests"
+        );
     }
 
     #[cfg(feature = "render")]
