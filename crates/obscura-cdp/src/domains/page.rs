@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
+use crate::network_request::request_payload;
 use crate::util::url_is_file_scheme;
 
 #[cfg(feature = "render")]
@@ -849,7 +850,7 @@ pub fn emit_navigation_events(
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "postData": net_event.post_data, "hasPostData": net_event.post_data.is_some()}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request_payload(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
     }
@@ -910,11 +911,7 @@ pub fn emit_navigation_events(
                 method: "Fetch.requestPaused".into(),
                 params: json!({
                     "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
+                    "request": request_payload(net_event),
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
@@ -929,7 +926,7 @@ pub fn emit_navigation_events(
         if Some(i) != nav_idx {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "postData": net_event.post_data, "hasPostData": net_event.post_data.is_some()}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request_payload(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
         }
@@ -1030,13 +1027,7 @@ pub(crate) fn emit_runtime_network_events(
                 "requestId": request_id,
                 "loaderId": loader_id,
                 "documentURL": page_url,
-                "request": {
-                    "url": network_event.url,
-                    "method": network_event.method,
-                    "headers": network_event.headers,
-                    "postData": network_event.post_data,
-                    "hasPostData": network_event.post_data.is_some(),
-                },
+                "request": request_payload(network_event),
                 "timestamp": network_event.timestamp,
                 "wallTime": network_event.timestamp,
                 "initiator": {"type": "script"},
@@ -1714,6 +1705,10 @@ mod tests {
         assert_eq!(ctx.pending_events[0].params["loaderId"], "loader-current");
         assert_eq!(ctx.pending_events[0].params["request"]["postData"], "cursor=next");
         assert_eq!(ctx.pending_events[0].params["request"]["hasPostData"], true);
+        assert_eq!(
+            ctx.pending_events[0].params["request"]["postDataEntries"],
+            json!([{"bytes": "Y3Vyc29yPW5leHQ="}]),
+        );
         assert_eq!(ctx.pending_events[1].method, "Network.responseReceived");
         assert_eq!(ctx.pending_events[1].params["loaderId"], "loader-current");
         assert_eq!(ctx.pending_events[2].method, "Network.loadingFinished");

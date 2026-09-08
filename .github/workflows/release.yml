@@ -68,6 +68,9 @@ jobs:
       - name: Verify scripted response events and bodies on both transports
         run: cargo nextest run --locked --release -p obscura-browser --features render,stealth --test scripted_network --test-threads 1
 
+      - name: Verify CDP cursor request encoding
+        run: cargo nextest run --locked --release -p obscura-cdp --features render,obscura-browser/stealth --lib -E 'test(runtime_network_events_reuse)' --test-threads 1
+
       - name: Verify native V8 snapshot and rendering
         run: |
           timeout 30s target/release/obscura --stealth fetch 'data:text/html,<title>ok</title>' --timeout 15 --eval '1+1'
