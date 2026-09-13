@@ -6632,6 +6632,33 @@ mod tests {
     }
 
     #[test]
+    fn node_identity_and_element_id_follow_dom_conversion_rules() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id=""></div><div id="null"></div><div id="undefined"></div></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const node = document.body.firstChild;
+                  return [
+                    node.contains(node),
+                    node.isSameNode(null),
+                    document.getElementById("") === null,
+                    document.getElementById(null)?.id,
+                    document.getElementById(undefined)?.id
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, "null", "undefined"])
+        );
+    }
+
+    #[test]
     fn document_title_setter_creates_missing_title_element() {
         let mut rt = setup_runtime("<html><body><main>content</main></body></html>");
         let result = rt
