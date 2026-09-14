@@ -7272,7 +7272,11 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (request ? request.method : "GET");
+  // Normalize the method to uppercase, matching the Request constructor, so
+  // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
+  // and lowercase standard methods are not rejected by the case-sensitive CORS
+  // checks (#969).
+  const method = String(init.method || (request ? request.method : "GET")).toUpperCase();
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
   const inheritsRequestBody = init.body === undefined && request !== null;
