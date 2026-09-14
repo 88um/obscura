@@ -780,6 +780,8 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Exact measurement results retained across repeated Taffy probes.
+    measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1736,6 +1738,7 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            measured: Vec::new(),
         });
         Some(idx)
     }
@@ -1756,20 +1759,33 @@ impl TextEngine {
     }
 
     fn measure_text_with_wrap(&mut self, idx: usize, width: Option<f32>, wrap: Wrap) -> (f32, f32) {
+        let key = width.map(f32::to_bits);
+        if let Some((_, _, size)) = self.items[idx]
+            .measured
+            .iter()
+            .find(|(cached_width, cached_wrap, _)| *cached_width == key && *cached_wrap == wrap)
+        {
+            return *size;
+        }
         let TextEngine {
             font_system, items, ..
         } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
         let (width, height, clamped) = buffer_size(item);
-        (
+        let size = (
             width,
             if clamped {
                 height
             } else {
                 height.max(item.forced_min_height)
             },
-        )
+        );
+        if item.measured.len() == 16 {
+            item.measured.remove(0);
+        }
+        item.measured.push((key, wrap, size));
+        size
     }
 
     /// Exact max-content size for one fallback word item. Paragraph IFCs keep
@@ -3841,6 +3857,63 @@ mod tests {
         assert!(
             cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
         );
+    }
+
+    #[test]
+    fn repeated_measurements_reuse_exact_results_and_preserve_final_paint() {
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>alpha <span id='inline'>beta gamma delta epsilon</span> zeta</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let base = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            text_indent: Some(Dimension::Px(7.25)),
+            ..Default::default()
+        };
+        let child = LayoutStyle {
+            display: Display::Inline,
+            padding: crate::Edges {
+                left: 3.5,
+                right: 2.25,
+                ..Default::default()
+            },
+            ..base.clone()
+        };
+        let styles = HashMap::from([(copy, base), (inline, child)]);
+        let mut engine = TextEngine::new();
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+
+        for (width, wrap) in [
+            (None, Wrap::WordOrGlyph),
+            (Some(0.0), Wrap::WordOrGlyph),
+            (Some(100.01), Wrap::None),
+            (Some(100.49), Wrap::WordOrGlyph),
+            (Some(100.51), Wrap::Glyph),
+        ] {
+            let actual = engine.measure_text_with_wrap(item, width, wrap);
+            let cached_entries = engine.items[item].measured.len();
+            assert_eq!(
+                engine.measure_text_with_wrap(item, width, wrap),
+                actual
+            );
+            assert_eq!(engine.items[item].measured.len(), cached_entries);
+
+            let mut fresh = TextEngine::new();
+            let fresh_item = fresh.try_build(&tree, copy, &styles).unwrap();
+            assert_eq!(
+                actual,
+                fresh.measure_text_with_wrap(fresh_item, width, wrap)
+            );
+            engine.finalize(item, (0.0, 0.0), 100.49, None);
+            fresh.finalize(fresh_item, (0.0, 0.0), 100.49, None);
+            let mut actual_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            let mut expected_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            engine.paint_item(item, &mut actual_image, (0.0, 0.0));
+            fresh.paint_item(fresh_item, &mut expected_image, (0.0, 0.0));
+            assert_eq!(actual_image.data(), expected_image.data());
+        }
     }
 
     #[test]
