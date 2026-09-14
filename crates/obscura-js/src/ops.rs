@@ -2959,6 +2959,15 @@ async fn op_fetch_url(
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
 
+        // Fetch spec: the preflight response's status must be an ok status
+        // before its CORS headers are consulted (#973).
+        if !preflight.status().is_success() {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight returned HTTP {}",
+                preflight.status()
+            )));
+        }
+
         let allowed_origin = preflight
             .headers()
             .get("access-control-allow-origin")
@@ -2974,12 +2983,6 @@ async fn op_fetch_url(
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
-            )));
-        }
-        if !preflight.status().is_success() {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "CORS preflight returned HTTP {}",
-                preflight.status()
             )));
         }
 
@@ -3135,6 +3138,33 @@ async fn op_fetch_url(
 
         if !resp.status().is_redirection() {
             break resp;
+        }
+
+        // Fetch spec: the CORS check applies to every response in cors mode,
+        // not only the final one. A cross-origin redirect response must be
+        // authorized before it is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = resp
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let allow_credentials = resp
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
 
         let location_header = resp
@@ -3418,6 +3448,31 @@ async fn stealth_fetch_all(
 
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body);
+        }
+        // Cross-origin redirect responses must pass the CORS check too, before
+        // the redirect is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = r
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str)
+                .unwrap_or("");
+            let allow_credentials = r
+                .headers
+                .get("access-control-allow-credentials")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
         let Some(location) = r.headers.get("location").cloned() else {
             break (r.status, r.headers, r.body);

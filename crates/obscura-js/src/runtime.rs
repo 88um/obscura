@@ -17471,6 +17471,77 @@ mod tests {
         redirect_runtime_for_origin(&format!("http://{source_address}"))
     }
 
+    // A redirector (cross-origin to the page) whose 302 carries no
+    // Access-Control-Allow-Origin, pointing at its own /final which does allow.
+    // Returns the runtime (page on a distinct origin) and the redirector base.
+    fn cross_origin_intermediate_redirect_runtime() -> (ObscuraJsRuntime, String) {
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_address = redirector.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = redirector.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let request = String::from_utf8_lossy(&buffer);
+                let response = if request.contains("/final") {
+                    "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                } else {
+                    // 302 WITHOUT Access-Control-Allow-Origin.
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        // The page lives on a distinct origin, so the fetch is cross-origin.
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page.local_addr().unwrap();
+        drop(page);
+
+        (
+            redirect_runtime_for_origin(&format!("http://{page_address}")),
+            format!("http://{redirector_address}"),
+        )
+    }
+
+    // #973: in cors mode, a cross-origin redirect response that lacks
+    // Access-Control-Allow-Origin must be rejected before it is followed, even
+    // if the final destination would authorize the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_mode_blocks_unauthorized_cross_origin_redirect_hop() {
+        let (mut rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        try {{
+                            await fetch("{redirector}/start", {{ mode: "cors" }});
+                            return "allowed";
+                        }} catch (e) {{
+                            return "blocked";
+                        }}
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!("blocked"),
+            "a cross-origin redirect without Access-Control-Allow-Origin must be blocked in cors mode"
+        );
+    }
+
     /// HTTP-redirect fetch returns a network error as soon as the
     /// redirect count *reaches* 20, and only increments it afterwards. So
     /// the twentieth hop must still succeed:
