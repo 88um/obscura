@@ -15922,6 +15922,59 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _iframeRealmGlobalNameSet = new Set(_iframeRealmGlobalNames);
 })();
 
+// WebIDL creates interface operations on the interface prototype object with
+// { writable: true, enumerable: true, configurable: true }
+// (https://webidl.spec.whatwg.org/#dfn-create-operation-function), so in a real
+// browser `Object.keys(MutationObserver.prototype)` is
+// ['observe', 'disconnect', 'takeRecords']. ES class methods are
+// enumerable: false, so every interface written as a `class` here disagrees with
+// the platform on that one descriptor bit.
+//
+// zone.js — which Angular installs on every page — discovers methods by walking
+// `for (prop in instance)` in patchClass(), applied to MutationObserver,
+// WebKitMutationObserver, IntersectionObserver and FileReader. With
+// enumerable: false it finds no methods at all and builds its proxy prototype
+// out of whatever instance fields happen to be enumerable, so the patched class
+// ends up with `_callback`/`_targets`/`_records` and no `observe`. Angular's
+// router then dies on `TypeError: n.observe is not a function` and the page
+// never renders. #245 was the same disagreement on the
+// getOwnPropertyDescriptor path; this is the for-in path.
+//
+// Only spec operations are exposed. Internals stay hidden behind the `_` prefix,
+// which keeps Object.keys() output identical to Chrome's.
+(function _markWebIdlOperationsEnumerable() {
+  var INTERFACES = [
+    'MutationObserver',
+    'IntersectionObserver',
+    'ResizeObserver',
+    'PerformanceObserver',
+    'FileReader',
+  ];
+  for (var i = 0; i < INTERFACES.length; i++) {
+    var ctor;
+    try { ctor = globalThis[INTERFACES[i]]; } catch (e) { continue; }
+    if (typeof ctor !== 'function' || !ctor.prototype) { continue; }
+    var proto = ctor.prototype;
+    var keys = Object.getOwnPropertyNames(proto);
+    for (var k = 0; k < keys.length; k++) {
+      var key = keys[k];
+      if (key === 'constructor' || key.charAt(0) === '_') { continue; }
+      var d;
+      try { d = Object.getOwnPropertyDescriptor(proto, key); } catch (e) { continue; }
+      if (!d || d.enumerable || !d.configurable) { continue; }
+      if (typeof d.value !== 'function') { continue; }
+      try {
+        Object.defineProperty(proto, key, {
+          value: d.value,
+          writable: d.writable,
+          enumerable: true,
+          configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
+})();
+
 (function _markBuiltinsNative() {
   var seen = new Set();
   function walk(ctor) {
