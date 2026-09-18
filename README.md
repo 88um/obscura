@@ -80,8 +80,8 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven3.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
