@@ -15,15 +15,15 @@ use tokio::sync::RwLock;
 use url::Url;
 
 #[cfg(feature = "stealth")]
-use crate::cookies::CookieJar;
-#[cfg(feature = "stealth")]
 use crate::client::{
-    CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
-    fetch_file_url, is_forbidden_ip, redirect_taints_origin, request_fetch_site,
-    request_referrer, response_too_large, serialized_request_origin, validate_cors_response,
-    validate_request_mode, validate_url,
+    cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
+    redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
+    same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
+    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    ResourceRequest, Response, SsrfGuardResolver,
 };
+#[cfg(feature = "stealth")]
+use crate::cookies::{CookieJar, SameSiteContext};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -346,7 +346,14 @@ impl StealthHttpClient {
             let request_origin = serialized_request_origin(&request, redirect_tainted);
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
-                self.cookie_jar.get_cookie_header(&current_url)
+                self.cookie_jar.get_cookie_header_in_context(
+                    &current_url,
+                    same_site_context(
+                        &request,
+                        &current_url,
+                        request.mode == crate::RequestMode::Navigate,
+                    ),
+                )
             } else {
                 String::new()
             };
@@ -464,6 +471,28 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        self.send_single_with_context(
+            method,
+            url,
+            headers,
+            body,
+            send_cookies.then_some(SameSiteContext::SameSite),
+            store_cookies,
+        )
+        .await
+    }
+
+    /// One request with an explicit cookie site context. Scripted fetch/XHR
+    /// uses this so Strict and Lax cookies cannot leak cross-site.
+    pub async fn send_single_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+    ) -> Result<Response, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
             return Ok(Response {
@@ -480,8 +509,8 @@ impl StealthHttpClient {
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
 
-        if send_cookies {
-            let cookie_header = self.cookie_jar.get_cookie_header(url);
+        if let Some(context) = cookie_context {
+            let cookie_header = self.cookie_jar.get_cookie_header_in_context(url, context);
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
@@ -813,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");

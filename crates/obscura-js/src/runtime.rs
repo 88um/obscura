@@ -611,6 +611,8 @@ impl ObscuraJsRuntime {
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
+        #[cfg(test)]
+        instance.expose_ops_for_tests();
 
         // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
         // entered for life. Leave the thread's entry stack empty instead; every
@@ -663,9 +665,9 @@ impl ObscuraJsRuntime {
     /// Takes the ops object bootstrap handed out, and removes the handoff from
     /// the global so page script can never reach `Deno.core.ops`.
     ///
-    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
-    /// reference in a private const, so this handoff is the only way for the
-    /// host to reach the bound op functions and pass them to a child realm.
+    /// Bootstrap keeps the core reference in a private const. Once deno_core
+    /// has bound the ops, this removes both public globals before page code can
+    /// run, leaving the handoff as the host's only route to child realms.
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
@@ -677,6 +679,7 @@ impl ObscuraJsRuntime {
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let deno_key = v8::String::new(scope, "Deno")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -688,7 +691,30 @@ impl ObscuraJsRuntime {
         }
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
+        global.delete(scope, deno_key.into());
         Some(ops)
+    }
+
+    /// Test-only instrumentation seam for assertions about native-op batching.
+    /// Production builds do not compile this method or publish the op table.
+    #[cfg(test)]
+    fn expose_ops_for_tests(&mut self) {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return;
+        };
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let Some(key) = v8::String::new(scope, "__obscura_test_ops") else {
+            return;
+        };
+        let value = v8::Local::new(scope, ops);
+        let _ = context.global(scope).set(scope, key.into(), value);
     }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
@@ -756,6 +782,9 @@ impl ObscuraJsRuntime {
         let Some(ops_key) = v8::String::new(scope, "ops") else {
             return false;
         };
+        let Some(deno_key) = v8::String::new(scope, "Deno") else {
+            return false;
+        };
         let global = context.global(scope);
         let Some(core) = global.get(scope, handoff_key.into()) else {
             return false;
@@ -793,6 +822,7 @@ impl ObscuraJsRuntime {
         }
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
+        global.delete(scope, deno_key.into());
         copied > 0
     }
 
@@ -4246,6 +4276,24 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn page_script_cannot_reach_deno_core_or_bootstrap_handoff() {
+        let mut rt = setup_runtime("<html><body><p id='value'>safe</p></body></html>");
+        rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
+
+        assert_eq!(
+            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff]")
+                .unwrap(),
+            serde_json::json!(["undefined", "undefined", "undefined"])
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('value').textContent")
+                .unwrap(),
+            serde_json::json!("safe"),
+            "DOM ops must continue to work through the private closure"
+        );
     }
 
     // #1013: removeAttribute('id') must update the id_index so getElementById no
@@ -11875,19 +11923,19 @@ mod tests {
                 globalThis.__resizeBulkSizes = [];
                 globalThis.__resizeLegacyGeometryCalls = 0;
                 globalThis.__resizeComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_resize_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_resize_observer_measurements = input => {
+                const nativeBulk = __obscura_test_ops.op_resize_observer_measurements;
+                const nativeGeometry = __obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = __obscura_test_ops.op_computed_style;
+                __obscura_test_ops.op_resize_observer_measurements = input => {
                     __resizeBulkCalls++;
                     __resizeBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                __obscura_test_ops.op_computed_style = (...args) => {
                     __resizeComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -12040,8 +12088,8 @@ mod tests {
             "count-scroll-geometry-reads",
             r#"
                 globalThis.__scrollGeometryReads = 0;
-                globalThis.__nativeLayoutGeometry = Deno.core.ops.op_layout_geometry;
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                globalThis.__nativeLayoutGeometry = __obscura_test_ops.op_layout_geometry;
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __scrollGeometryReads++;
                     return __nativeLayoutGeometry(...args);
                 };
@@ -12055,7 +12103,7 @@ mod tests {
             .unwrap();
         rt.execute_script(
             "restore-layout-geometry-op",
-            "Deno.core.ops.op_layout_geometry = __nativeLayoutGeometry;",
+            "__obscura_test_ops.op_layout_geometry = __nativeLayoutGeometry;",
         )
         .unwrap();
         assert_eq!(result, serde_json::json!([50, 0, 1]));
@@ -12242,19 +12290,19 @@ mod tests {
                 globalThis.__intersectionBulkSizes = [];
                 globalThis.__intersectionLegacyGeometryCalls = 0;
                 globalThis.__intersectionComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_intersection_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_intersection_observer_measurements = input => {
+                const nativeBulk = __obscura_test_ops.op_intersection_observer_measurements;
+                const nativeGeometry = __obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = __obscura_test_ops.op_computed_style;
+                __obscura_test_ops.op_intersection_observer_measurements = input => {
                     __intersectionBulkCalls++;
                     __intersectionBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                __obscura_test_ops.op_computed_style = (...args) => {
                     __intersectionComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -16492,7 +16540,7 @@ mod tests {
         let url = url::Url::parse("http://example.com/test").unwrap();
         let result = rt.evaluate("document.cookie").unwrap();
         assert!(result.as_str().unwrap().contains("foo=bar"));
-        let header = jar.get_cookie_header(&url);
+        let header = jar.get_cookie_header_same_site(&url);
         assert!(
             header.contains("foo=bar"),
             "cookie should be in jar, got: {}",
@@ -16542,7 +16590,7 @@ mod tests {
             "cookie should be deleted, got: {}",
             result
         );
-        assert!(!jar.get_cookie_header(&url).contains("temp="));
+        assert!(!jar.get_cookie_header_same_site(&url).contains("temp="));
     }
 
     #[test]
@@ -16955,10 +17003,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 const seen = [];
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
+                    __obscura_test_ops.op_fetch_url = (url) => {
                         seen.push(url);
                         return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
                     };
@@ -16969,7 +17017,7 @@ mod tests {
                     await new Promise((r) => setTimeout(r, 0));
                     return seen;
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
             }"#,
                 None,
@@ -16996,9 +17044,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
+                    __obscura_test_ops.op_fetch_url = (url) => {
                         globalThis.__capturedFetchUrl = url;
                         return JSON.stringify({
                             status: 200,
@@ -17011,7 +17059,7 @@ mod tests {
                     const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
                     return { url: globalThis.__capturedFetchUrl, bytes };
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
             }"#,
                 None,
@@ -17040,17 +17088,17 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const original = Deno.core.ops.op_fetch_url;
+                const original = __obscura_test_ops.op_fetch_url;
                 let captured = null;
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method) => {
+                    __obscura_test_ops.op_fetch_url = (url, method) => {
                         captured = method;
                         return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
                     };
                     await fetch(new URL("/api", document.URL), { method: "delete" });
                     return captured;
                 } finally {
-                    Deno.core.ops.op_fetch_url = original;
+                    __obscura_test_ops.op_fetch_url = original;
                 }
             }"#,
                 None,
@@ -17074,10 +17122,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body, origin, mode, credentials) => {
                                 calls.push({ url, credentials });
                                 return JSON.stringify({
@@ -17115,7 +17163,7 @@ mod tests {
 
                         return { calls, invalidFetchRejected };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17228,10 +17276,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body) => {
                                 calls.push({
                                     path: new URL(url).pathname,
@@ -17291,7 +17339,7 @@ mod tests {
 
                         return calls;
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17322,7 +17370,7 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     const includesBytes = (bytes, needle) => {
                         outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
@@ -17334,7 +17382,7 @@ mod tests {
                         return false;
                     };
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body) => {
                                 const bytes = Array.from(
                                     body instanceof Uint8Array
@@ -17410,7 +17458,7 @@ mod tests {
                             },
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17868,7 +17916,15 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/start", { mode: "no-cors" });
-                    return { type: response.type, url: response.url, redirected: response.redirected };
+                    return {
+                        type: response.type,
+                        url: response.url,
+                        redirected: response.redirected,
+                        status: response.status,
+                        body: await response.text(),
+                        bodyIsNull: response.body === null,
+                        headerCount: Array.from(response.headers).length,
+                    };
                 }"#,
                 None,
                 &[],
@@ -17879,7 +17935,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+            serde_json::json!({
+                "type": "opaque",
+                "url": "",
+                "redirected": false,
+                "status": 0,
+                "body": "",
+                "bodyIsNull": true,
+                "headerCount": 0,
+            })
         );
     }
 
@@ -17944,9 +18008,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        __obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 200,
                             headers: { "content-type": "text/css" },
                             body: url.endsWith("/assets/route.css")
@@ -17962,12 +18026,10 @@ mod tests {
                         });
                         document.head.appendChild(link);
                         await loaded;
-                        const style = document.querySelector("style[data-obscura-linked]");
-                        const css = style.textContent;
-                        const afterLink = link.nextSibling === style;
                         const list = document.styleSheets;
                         const sheet = link.sheet;
                         const rules = sheet.cssRules;
+                        const css = Array.from(rules, rule => rule.cssText).join("\n");
                         const cssom = {
                             listed: list.length === 1 && list[0] === sheet,
                             stable: link.sheet === sheet && sheet.cssRules === rules,
@@ -17977,22 +18039,22 @@ mod tests {
                         };
                         link.remove();
                         return {
-                            afterLink,
+                            noSyntheticStyle:
+                                !document.querySelector("style[data-obscura-linked]"),
                             importedBeforeRoute:
-                                css.indexOf("color:red") < css.indexOf("display:grid"),
+                                rules[0].cssText.includes("color")
+                                && rules[1].cssText.includes("display"),
                             importedUrl:
                                 css.includes("http://example.com/assets/theme/grain.png"),
                             routeUrl:
                                 css.includes("http://example.com/img/card.png"),
-                            removedWithLink:
-                                !document.querySelector("style[data-obscura-linked]"),
                             cssom,
                             detachedCssom: sheet.ownerNode === null
                                 && link.sheet === null
                                 && list.length === 0,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -18006,11 +18068,10 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!({
-                "afterLink": true,
+                "noSyntheticStyle": true,
                 "importedBeforeRoute": true,
                 "importedUrl": true,
                 "routeUrl": true,
-                "removedWithLink": true,
                 "cssom": {
                     "listed": true,
                     "stable": true,
@@ -18029,9 +18090,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        __obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 401,
                             headers: { "content-type": "application/json" },
                             body: "globalThis.__executedFailedScript = true",
@@ -18049,7 +18110,7 @@ mod tests {
                             executed: globalThis.__executedFailedScript === true,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -18070,15 +18131,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = "globalThis.__crossOriginScriptLoaded = true";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page.local_addr().unwrap();
+        drop(page);
+        let mut rt = redirect_runtime_for_origin(&format!("http://{page_address}"));
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        const script = document.createElement("script");
+                        script.src = "http://{address}/script.js";
+                        const outcome = await new Promise(resolve => {{
+                            script.onload = () => resolve("load");
+                            script.onerror = () => resolve("error");
+                            document.head.appendChild(script);
+                        }});
+                        return {{ outcome, loaded: globalThis.__crossOriginScriptLoaded === true }};
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "outcome": "load", "loaded": true })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_origin_follows_the_final_redirect_url() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
+                    try {
+                        __obscura_test_ops.op_fetch_url = async () => JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "text/html" },
+                            body: "<!doctype html><title>secret</title>",
+                            url: "https://cross-origin.example/secret",
+                            redirected: true,
+                        });
+                        const frame = document.createElement("iframe");
+                        const loaded = new Promise(resolve => frame.onload = resolve);
+                        frame.src = "/same-origin-start";
+                        document.body.appendChild(frame);
+                        await loaded;
+                        return {
+                            readable: frame.contentDocument !== null,
+                            loadedUrl: frame._iframeLoadedUrl,
+                        };
+                    } finally {
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "readable": false,
+                "loadedUrl": "https://cross-origin.example/secret",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const runPair = async (explicitlyInOrder) => {
                         globalThis.__dynamicOrder = [];
-                        Deno.core.ops.op_fetch_url = (url) => new Promise(resolve => {
+                        __obscura_test_ops.op_fetch_url = (url) => new Promise(resolve => {
                             const slow = url.includes("slow");
                             setTimeout(() => resolve(JSON.stringify({
                                 status: 200,
@@ -18106,7 +18261,7 @@ mod tests {
                             pending: globalThis.__obscura_hasPendingDynamicScripts(),
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -19826,9 +19981,9 @@ mod tests {
                 document.body.appendChild(parsed.querySelector("script"));
 
                 let externalFetches = 0;
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = () => {
+                    __obscura_test_ops.op_fetch_url = () => {
                         externalFetches++;
                         return JSON.stringify({
                             status: 200,
@@ -19841,7 +19996,7 @@ mod tests {
                     external.innerHTML = "<script src=/inert.js><\/script>";
                     document.head.appendChild(external.firstChild);
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
                 return [globalThis.__fragmentScriptRuns, externalFetches];
                 "#,
