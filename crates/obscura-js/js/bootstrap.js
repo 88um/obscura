@@ -920,14 +920,17 @@ const _scheduleAfter = (delay, fn) => {
     return frameTimerId;
   }
   // The callback runs only when the embedder pumps the event loop, after the
-  // current microtask checkpoint.
-  return __obscuraCore.queueUserTimer(0, false, d, () => {
+  // current microtask checkpoint. deno_core's timer queue drives the callback
+  // from the native event loop; the returned timer object doubles as the
+  // cancel handle. A refed timer keeps the event loop alive until it fires,
+  // which is how a page with only pending timers stays observable.
+  return __obscuraCore.createTimer(() => {
     // HTML timer/observer/rAF delivery starts a new task. Freeze animation
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
     __obscuraCore.ops.op_begin_render_task?.();
     return fn();
-  });
+  }, d, undefined, false, true, false);
 };
 
 const _cancelScheduled = (nativeId) => {
@@ -936,7 +939,9 @@ const _cancelScheduled = (nativeId) => {
     if (state) state.cancelled = true;
     _frameTimerStates.delete(nativeId);
   }
-  else __obscuraCore.cancelTimer(nativeId);
+  else if (nativeId !== undefined && nativeId !== null) {
+    __obscuraCore.cancelTimer(nativeId);
+  }
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
