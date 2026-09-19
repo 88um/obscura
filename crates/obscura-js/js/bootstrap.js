@@ -28,7 +28,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
-    '__obscura_hasPendingLoadDelayingScripts',
+    '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
@@ -267,6 +267,10 @@ let __dynScriptQueue = [];
 let __dynScriptBusy = false;
 let __dynClassicPending = 0;
 let __dynLoadDelayingPending = 0;
+let __parserBlockingScriptQueue = [];
+let __parserBlockingScriptBusy = false;
+let __parserBlockingScriptPending = 0;
+const __documentWriteScripts = new WeakSet();
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
@@ -282,6 +286,12 @@ Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
 // Keep this bridge hidden for the same reason as the general queue status.
 Object.defineProperty(globalThis, '__obscura_hasPendingLoadDelayingScripts', {
   value: function() { return __dynLoadDelayingPending > 0; },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, '__obscura_hasPendingParserBlockingScripts', {
+  value: function() { return __parserBlockingScriptPending > 0; },
   writable: false,
   enumerable: false,
   configurable: false,
@@ -371,10 +381,13 @@ async function __runDynScriptTask(task) {
     if (task.isModule) {
       await import(task.url);
     } else {
-      if (!task.fetchResult) __startDynClassicFetch(task);
-      const fetched = await task.fetchResult;
-      if (fetched.error) throw fetched.error;
-      const body = fetched.body;
+      let body = task.inlineCode;
+      if (body === undefined) {
+        if (!task.fetchResult) __startDynClassicFetch(task);
+        const fetched = await task.fetchResult;
+        if (fetched.error) throw fetched.error;
+        body = fetched.body;
+      }
       if (body) {
         // A fetched async script is executed by a ScriptRunner task, not by
         // the fetch promise's microtask continuation. Besides matching event
@@ -427,6 +440,23 @@ async function __processDynScriptQueue() {
     }
   } finally {
     __dynScriptBusy = false;
+  }
+}
+async function __processParserBlockingScriptQueue() {
+  if (__parserBlockingScriptBusy) return;
+  __parserBlockingScriptBusy = true;
+  try {
+    while (__parserBlockingScriptQueue.length > 0) {
+      const entry = __parserBlockingScriptQueue.shift();
+      if (!entry.blocking) {
+        __runAsyncClassicScript(entry.task);
+        continue;
+      }
+      try { await __runDynScriptTask(entry.task); }
+      finally { __parserBlockingScriptPending--; }
+    }
+  } finally {
+    __parserBlockingScriptBusy = false;
   }
 }
 // Resolve a resource URL (script src / link href) against <base href> or the
@@ -1948,6 +1978,10 @@ function __prepareInsertedScript(script) {
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
   const prevNid = globalThis.__currentScriptNid;
+  const parserInserted = __documentWriteScripts.has(script);
+  const parserBlocking = parserInserted
+    && !isModule
+    && (!src || (!script.hasAttribute('async') && !script.hasAttribute('defer')));
   if (src) {
     let baseHref;
     try {
@@ -1982,6 +2016,13 @@ function __prepareInsertedScript(script) {
     // not turn already-prepared work into a post-load enhancement.
     task.delaysLoad = globalThis.document?.readyState !== 'complete';
     if (task.delaysLoad) __dynLoadDelayingPending++;
+    if (parserInserted && !isModule) {
+      task.prevNid = 0;
+      if (parserBlocking) __parserBlockingScriptPending++;
+      __parserBlockingScriptQueue.push({ task, blocking: parserBlocking });
+      __processParserBlockingScriptQueue();
+      return;
+    }
     // A non-parser-inserted classic script is force-async unless script code
     // explicitly assigned `.async = false`. Keep that opt-out in insertion
     // order; default/async=true scripts fetch concurrently and execute as soon
@@ -2018,6 +2059,20 @@ function __prepareInsertedScript(script) {
     if (task.delaysLoad) __dynLoadDelayingPending++;
     __dynScriptQueue.push(task);
     __processDynScriptQueue();
+  } else if (parserBlocking) {
+    __parserBlockingScriptPending++;
+    __parserBlockingScriptQueue.push({
+      blocking: true,
+      task: {
+        inlineCode: code,
+        isModule: false,
+        nid: script._nid,
+        prevNid: 0,
+        dispatchEvent: () => {},
+        delaysLoad: false,
+      },
+    });
+    __processParserBlockingScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;
     try { (0, eval)(code); }
@@ -5898,6 +5953,9 @@ class Document extends Node {
       var parentNid = +placements[i][0];
       var node = _wrap(+placements[i][1]);
       if (!node) continue;
+      if (node.nodeType === 1 && node.tagName === 'SCRIPT') {
+        __documentWriteScripts.add(node);
+      }
       if (parentNid) {
         var parent = _wrap(parentNid);
         if (parent) parent.appendChild(node);
