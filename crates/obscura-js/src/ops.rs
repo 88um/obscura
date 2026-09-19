@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -302,6 +302,9 @@ pub struct ObscuraState {
     /// The document's input stream for `document.write()`, created on the first call.
     /// Why the calls share one parser is in `write_stream`.
     pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
+    /// Cheap native signal that the current parser script wrote another
+    /// script. This avoids polling V8 after every ordinary parser script.
+    pub(crate) document_write_inserted_script: Cell<bool>,
 }
 
 /// A frame document waiting to be given a realm.
@@ -436,6 +439,7 @@ impl ObscuraState {
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
             write_stream: RefCell::new(None),
+            document_write_inserted_script: Cell::new(false),
         }
     }
 }
@@ -2163,8 +2167,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_write" => {
             let mut slot = gs.write_stream.borrow_mut();
             let stream = slot.get_or_insert_with(DocumentWriteStream::new);
-            let pairs: Vec<[i32; 2]> = stream
-                .write(&arg2, dom)
+            let placements = stream.write(&arg2, dom);
+            if placements
+                .iter()
+                .any(|placement| node_is_script(dom, placement.node))
+            {
+                gs.document_write_inserted_script.set(true);
+            }
+            let pairs: Vec<[i32; 2]> = placements
                 .iter()
                 .map(|placement| {
                     [
@@ -2178,6 +2188,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
             *gs.write_stream.borrow_mut() = None;
+            gs.document_write_inserted_script.set(false);
             "true".into()
         }
         "set_text_content" => {

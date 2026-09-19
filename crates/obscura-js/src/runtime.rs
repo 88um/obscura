@@ -3343,6 +3343,26 @@ impl ObscuraJsRuntime {
             .unwrap_or(false)
     }
 
+    /// Whether a parser-blocking script inserted by `document.write()` still
+    /// has fetch or evaluation work outstanding.
+    pub fn has_pending_parser_blocking_scripts(&mut self) -> bool {
+        self.evaluate(
+            "globalThis.__obscura_hasPendingParserBlockingScripts?.() === true",
+        )
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    }
+
+    /// Consume the native signal that the current parser script called
+    /// `document.write()` with a script node.
+    pub fn take_document_write_inserted_script(&self) -> bool {
+        self.state
+            .borrow()
+            .document_write_inserted_script
+            .replace(false)
+    }
+
     /// Generation of observable connected-document mutations. This excludes
     /// detached-tree construction and no-op writes, which cannot affect a
     /// screenshot or DOM dump.
@@ -13952,6 +13972,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert!(!rt.has_pending_dynamic_scripts());
         assert!(!rt.has_pending_load_delaying_scripts());
+        assert!(!rt.has_pending_parser_blocking_scripts());
         assert_eq!(rt.next_pending_timeout_delay_ms(), None);
         assert_eq!(
             rt.evaluate("typeof __dynScriptBusy").unwrap(),
@@ -13974,6 +13995,13 @@ mod tests {
         assert_eq!(
             rt.evaluate(
                 "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingLoadDelayingScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingParserBlockingScripts')"
             )
             .unwrap(),
             serde_json::json!(false)

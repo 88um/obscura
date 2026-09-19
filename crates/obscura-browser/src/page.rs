@@ -2071,16 +2071,16 @@ impl Page {
         self.execute_scripts_with_module_budget(None).await;
     }
 
-    /// Drive only dynamic script elements which participate in the current
-    /// document's load-event delay set. Browser script runners keep this set
-    /// separate from arbitrary post-load imports, timers, and enhancement
-    /// scripts; navigation readiness must not turn those into an implicit
-    /// multi-second settle.
-    async fn drive_load_delaying_scripts(
+    /// Drive a selected script queue until it empties or the shared parser
+    /// deadline expires. The caller chooses the queue so parser blockers and
+    /// load-delaying dynamic scripts keep their distinct lifecycle semantics.
+    async fn drive_pending_scripts(
         js: &mut ObscuraJsRuntime,
         deadline: tokio::time::Instant,
+        pending: fn(&mut ObscuraJsRuntime) -> bool,
+        label: &str,
     ) -> bool {
-        while js.has_pending_load_delaying_scripts() {
+        while pending(js) {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
                 return false;
@@ -2096,13 +2096,13 @@ impl Page {
             .await
             {
                 Ok(Ok(_idle)) => {
-                    if js.has_pending_load_delaying_scripts() {
+                    if pending(js) {
                         tokio::task::yield_now().await;
                     }
                 }
                 Ok(Err(error)) => {
                     if obscura_js::runtime::is_fatal_event_loop_error(&error) {
-                        tracing::warn!("load-delaying dynamic script event loop failed: {error}");
+                        tracing::warn!("{label} script event loop failed: {error}");
                         return false;
                     }
                     // A load-delaying script threw or left an unhandled
@@ -2110,7 +2110,7 @@ impl Page {
                     // killing the pump would strand every still-pending script
                     // (#699). The absolute deadline above bounds a page that
                     // errors on every turn.
-                    tracing::warn!("load-delaying script task error, continuing: {error}");
+                    tracing::warn!("{label} script task error, continuing: {error}");
                     tokio::task::yield_now().await;
                 }
                 Err(_) => {
@@ -2120,6 +2120,32 @@ impl Page {
             }
         }
         true
+    }
+
+    async fn drive_load_delaying_scripts(
+        js: &mut ObscuraJsRuntime,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        Self::drive_pending_scripts(
+            js,
+            deadline,
+            ObscuraJsRuntime::has_pending_load_delaying_scripts,
+            "load-delaying",
+        )
+        .await
+    }
+
+    async fn drive_parser_blocking_scripts(
+        js: &mut ObscuraJsRuntime,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        Self::drive_pending_scripts(
+            js,
+            deadline,
+            ObscuraJsRuntime::has_pending_parser_blocking_scripts,
+            "parser-blocking",
+        )
+        .await
     }
 
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
@@ -2614,6 +2640,15 @@ impl Page {
                     } else {
                         let fetched_script = fetched.remove(&index);
                         execute_classic(self, script, fetched_script);
+                        if let Some(js) = &mut self.js {
+                            if js.take_document_write_inserted_script()
+                                && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                            {
+                                tracing::warn!(
+                                    "script deadline reached with a parser-blocking document.write script pending"
+                                );
+                            }
+                        }
                     }
                 }
                 ScriptKind::Module => {
@@ -2786,6 +2821,15 @@ impl Page {
                     let script = &all_scripts[index];
                     let fetched_script = fetched.remove(&index);
                     execute_classic(self, script, fetched_script);
+                    if let Some(js) = &mut self.js {
+                        if js.take_document_write_inserted_script()
+                            && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                        {
+                            tracing::warn!(
+                                "script deadline reached with a parser-blocking document.write script pending"
+                            );
+                        }
+                    }
                 }
                 ScheduledScript::Module {
                     prepared,
@@ -5601,6 +5645,49 @@ mod tests {
         (format!("http://{address}"), request_rx)
     }
 
+    fn spawn_written_script_order_server() -> String {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let vendor_finished = std::sync::Arc::new(AtomicBool::new(false));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let vendor_finished = vendor_finished.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let body = if path == "/vendor.js" {
+                        std::thread::sleep(std::time::Duration::from_millis(125));
+                        vendor_finished.store(true, Ordering::SeqCst);
+                        "globalThis.__vendorValue = 1;".to_string()
+                    } else {
+                        format!(
+                            "globalThis.__appRequestFollowedVendor = {}; globalThis.__appSawVendor = globalThis.__vendorValue;",
+                            vendor_finished.load(Ordering::SeqCst),
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
     fn spawn_script_resource_cache_server(
         distinct: bool,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -6863,6 +6950,77 @@ mod tests {
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_write_external_script_blocks_later_parser_scripts() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(75),
+            "globalThis.__writtenOrder.push('external'); globalThis.__writtenValue = 1;",
+        );
+        let html = format!(
+            r#"<html><body>
+                <script>globalThis.__writtenOrder = [];</script>
+                <script>
+                    document.write('<script src="{base}/written.js"><\/script>');
+                    document.write('<script>globalThis.__writtenOrder.push("written:" + String(globalThis.__writtenValue));<\/script>');
+                </script>
+                <script>globalThis.__writtenOrder.push('after:' + String(globalThis.__writtenValue));</script>
+            </body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "document-write-parser-blocking",
+            "http://127.0.0.1:9",
+            &html,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/written.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__writtenOrder")
+                .unwrap(),
+            serde_json::json!(["external", "written:1", "after:1"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_write_does_not_start_later_async_script_before_blocker() {
+        let base = spawn_written_script_order_server();
+        let html = format!(
+            r#"<html><body><script>
+                document.write('<script src="{base}/vendor.js"><\/script>');
+                document.write('<script async src="{base}/app.js"><\/script>');
+            </script><script>
+                globalThis.__afterWriteSawVendor = globalThis.__vendorValue;
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "document-write-async-after-blocker",
+            "http://127.0.0.1:9",
+            &html,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__afterWriteSawVendor, globalThis.__appSawVendor, globalThis.__appRequestFollowedVendor]"
+                )
+                .unwrap(),
+            serde_json::json!([1, 1, true]),
         );
     }
 
