@@ -3884,7 +3884,9 @@ impl Page {
 
     /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when
     /// the render feature is compiled in. None if the page has no DOM or the
-    /// viewport is zero-sized.
+    /// viewport is zero-sized. Never loads resources synchronously; without a
+    /// runtime, external assets remain unavailable until the page is resumed
+    /// and its resources are prepared.
     #[cfg(feature = "render")]
     pub fn screenshot(&self, viewport: (f32, f32)) -> Option<Vec<u8>> {
         self.screenshot_with_animation_sample(viewport, self.live_animation_sample())
@@ -3953,14 +3955,19 @@ impl Page {
                 return Some(png);
             }
         }
+        // A DOM-only page still owns network policy. Its fallback must not
+        // bypass the page transport through the standalone synchronous loader.
         self.with_dom(|dom| {
-            obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color(
+            let mut resources = obscura_js::RenderResourceCache::default();
+            resources.set_sync_loading_enabled(false);
+            obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
                 dom,
                 viewport,
                 base_url,
                 scroll,
                 animation_sample.time,
                 self.capture_surface_color(),
+                &mut resources,
             )
         })
             .flatten()
@@ -7639,38 +7646,86 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocked_render_resources_are_never_fetched_by_layout_or_transport() {
-        let (address, seen_rx) = spawn_delayed_svg_server(0, 4);
+    async fn assert_render_resource_blocklist(warmup: bool) {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 5);
         let page_url = format!("http://{address}/page");
-        let asset_url = format!("http://{address}/blocked.svg");
-        let mut page = page_with_transport_and_image("blocked", &page_url, &asset_url);
-        page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
+        let mut page = page_with_transport_and_body(
+            "blocked",
+            &page_url,
+            &format!(r#"
+                <img id="allowed" src="http://{address}/allowed.svg">
+                <img src="http://{address}/blocked.svg">
+                <div style="width:20px;height:20px;background-image:url(http://{address}/blocked-css.svg)"></div>
+            "#),
+        );
+        page.set_blocked_urls(vec!["*blocked*".to_string()]);
 
-        let started = std::time::Instant::now();
-        page.js
-            .as_mut()
-            .unwrap()
-            .evaluate("document.getElementById('i').getBoundingClientRect().width")
-            .unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(600));
+        // Each caller gets a fresh page: a prior miss cached by the other
+        // path would hide a missing blocklist check here.
+        if warmup {
+            assert_eq!(page.prepare_screenshot_resources(2_000).await, 1);
+        } else {
+            page.screenshot(page.viewport).expect("cache-only capture");
+            page.queue_pending_render_resources();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while page.has_pending_render_resources() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    page.drain_render_resource_results();
+                }
+            })
+            .await
+            .expect("renderer loads must finish");
+        }
         assert_eq!(
-            page.queue_pending_render_resources(),
-            0,
-            "a blocked URL must not start a transport request"
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('allowed').naturalWidth")
+                .unwrap()
+                .as_f64(),
+            Some(20.0),
+            "the allowed image must actually load"
         );
-        assert!(
-            page.js.as_ref().unwrap().render_image_resource_is_known(
-                &asset_url,
-                obscura_js::ImageRequestProfile::NoCorsInclude
-            ),
-            "a blocked URL is remembered as missing so layout stops asking"
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let requests: Vec<_> = seen_rx.try_iter().collect();
+        assert_eq!(
+            requests.len(), 1,
+            "only the allowed image may reach the server: {requests:?}"
         );
-        assert_eq!(page.prepare_screenshot_resources(200).await, 0);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(requests[0].starts_with("GET /allowed.svg "), "{requests:?}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn screenshot_warmup_honours_blocked_urls_on_a_fresh_page() {
+        assert_render_resource_blocklist(true).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_misses_honour_blocked_urls_on_a_fresh_page() {
+        assert_render_resource_blocklist(false).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn suspended_page_screenshot_never_opens_resource_requests() {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 5);
+        let mut page = page_with_transport_and_image(
+            "suspended-capture",
+            &format!("http://{address}/page"),
+            &format!("http://{address}/blocked.svg"),
+        );
+        page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
+        page.suspend_js();
+        assert!(page.js.is_none());
+        let png = page.screenshot(page.viewport).expect("DOM-only capture");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
-            seen_rx.try_recv().is_err(),
-            "Network.setBlockedURLs must also stop renderer-initiated loads"
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a suspended page must not use the synchronous renderer HTTP loader"
         );
     }
 
