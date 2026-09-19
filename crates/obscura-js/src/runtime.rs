@@ -20048,6 +20048,97 @@ mod tests {
         );
     }
 
+    // WebIDL puts interface operations on the interface prototype with
+    // enumerable: true, so in a browser Object.keys(MutationObserver.prototype)
+    // is ['observe', 'disconnect', 'takeRecords']. ES class methods are
+    // enumerable: false. Internals must stay hidden so the key set still matches
+    // Chrome exactly. See _markWebIdlOperationsEnumerable in bootstrap.js.
+    #[test]
+    fn webidl_operations_are_enumerable_on_interface_prototypes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const descriptor =
+                  Object.getOwnPropertyDescriptor(MutationObserver.prototype, 'observe');
+                return JSON.stringify({
+                  mutationObserver: Object.keys(MutationObserver.prototype).sort().join(','),
+                  intersectionObserver: Object.keys(IntersectionObserver.prototype).includes('observe'),
+                  resizeObserver: Object.keys(ResizeObserver.prototype).includes('observe'),
+                  performanceObserver: Object.keys(PerformanceObserver.prototype).includes('observe'),
+                  internalsHidden: !Object.keys(MutationObserver.prototype).includes('_notify'),
+                  writable: descriptor.writable,
+                  configurable: descriptor.configurable,
+                });
+                "#,
+            )
+            .unwrap();
+        let seen: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("descriptor json");
+        assert_eq!(seen["mutationObserver"], "disconnect,observe,takeRecords");
+        assert_eq!(seen["intersectionObserver"], true);
+        assert_eq!(seen["resizeObserver"], true);
+        assert_eq!(seen["performanceObserver"], true);
+        assert_eq!(seen["internalsHidden"], true);
+        // Still a method descriptor, not a data property masquerading as one.
+        assert_eq!(seen["writable"], true);
+        assert_eq!(seen["configurable"], true);
+    }
+
+    // Mirrors zone.js patchClass(), which Angular installs for MutationObserver:
+    // it builds a proxy prototype by walking `for (prop in instance)` and
+    // forwarding every function-valued property to the original instance. With
+    // enumerable: false methods that loop found nothing, so the patched class had
+    // no observe() and Angular's router died on "n.observe is not a function"
+    // before rendering anything. #245 was the same disagreement on the
+    // getOwnPropertyDescriptor path.
+    #[test]
+    fn zone_js_style_class_patch_finds_observer_operations() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const Original = globalThis.MutationObserver;
+                const ORIGINAL_INSTANCE = '__zone_symbol__originalInstance';
+                function Patched(...args) { this[ORIGINAL_INSTANCE] = new Original(...args); }
+                const forwarded = [];
+                const probe = new Original(function () {});
+                for (const prop in probe) {
+                  if (typeof probe[prop] !== 'function') continue;
+                  forwarded.push(prop);
+                  Patched.prototype[prop] = function () {
+                    return this[ORIGINAL_INSTANCE][prop].apply(this[ORIGINAL_INSTANCE], arguments);
+                  };
+                }
+
+                // Drive the patched class the way Angular drives it.
+                const observer = new Patched(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.appendChild(document.createElement('span'));
+                const taken = observer.takeRecords().length;
+                observer.disconnect();
+                return JSON.stringify({ forwarded: forwarded.sort().join(','), taken });
+                "#,
+            )
+            .unwrap();
+        let patched: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("patch json");
+        for operation in ["observe", "disconnect", "takeRecords"] {
+            assert!(
+                patched["forwarded"]
+                    .as_str()
+                    .expect("forwarded list")
+                    .contains(operation),
+                "zone.js-style for-in patch must discover {operation}, found: {}",
+                patched["forwarded"]
+            );
+        }
+        // And the forwarded observe() actually observes.
+        assert_eq!(patched["taken"], 1);
+    }
+
     // Writing goes through the same insertion steps as any other insertion.
     #[test]
     fn document_write_reports_to_mutation_observers() {
