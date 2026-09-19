@@ -80,6 +80,21 @@ OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.
 
+### `OBSCURA_BLOCK_TRACKERS`
+
+Controls the tracker blocklist used by the stealth HTTP transport. It is on by
+default so `--stealth` retains its current privacy-first behavior. Set it to
+`0`, `false`, `no`, or `off` to keep the stealth TLS/browser fingerprint while
+allowing tracker requests.
+
+The setting is read when a stealth client is created. Values are case-insensitive
+and surrounding whitespace is ignored; unset, empty, and unrecognized values keep
+blocking enabled. Non-stealth transport settings and SSRF protection are unchanged.
+
+```bash
+OBSCURA_BLOCK_TRACKERS=0 obscura --stealth fetch https://example.com
+```
+
 ### `OBSCURA_TIMEZONE`
 
 Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report one consistent zone. Default `Europe/Berlin`. Set it to match the exit IP's region.
