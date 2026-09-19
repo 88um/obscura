@@ -141,6 +141,12 @@ fn with_sync_render_loading_disabled<R>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccessibilityStyle {
+    pub display_none: bool,
+    pub visibility_hidden: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     /// True when this object is a value that was thrown or that a promise
@@ -3829,6 +3835,29 @@ impl ObscuraJsRuntime {
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
         state.dom.as_ref().map(f)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
+        let mut state = self.state.borrow_mut();
+        crate::ops::sample_live_document_animations(&mut state);
+        let Some(prepared) = crate::ops::ensure_prepared_render(&mut state) else {
+            return HashMap::new();
+        };
+        prepared
+            .layout()
+            .styles
+            .iter()
+            .map(|(id, style)| {
+                (
+                    *id,
+                    AccessibilityStyle {
+                        display_none: style.display == obscura_render::Display::None,
+                        visibility_hidden: style.visibility_hidden,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Absolute URLs the page requested via fetch()/XHR, in request order
