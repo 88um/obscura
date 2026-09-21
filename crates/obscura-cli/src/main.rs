@@ -32,7 +32,9 @@ struct Args {
     #[arg(long, global = true)]
     stealth: bool,
 
-    #[arg(long)]
+    /// Respect robots.txt before navigating to an HTTP(S) URL.
+    /// Global: applies to fetch and scrape.
+    #[arg(long, global = true)]
     obey_robots: bool,
 
     #[arg(long)]
@@ -94,6 +96,11 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
+        /// Repeat for multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -257,6 +264,30 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
+fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    if font_dirs.is_empty() {
+        return Ok(());
+    }
+    for directory in font_dirs {
+        if !directory.is_dir() {
+            anyhow::bail!(
+                "Font directory does not exist or is not a directory: {}",
+                directory.display()
+            );
+        }
+    }
+
+    #[cfg(feature = "render")]
+    {
+        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
+            anyhow::bail!("Font directories must be configured before the first render");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "render"))]
+    anyhow::bail!("--font-dir requires a render-enabled build")
+}
+
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
 }
@@ -299,8 +330,23 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -353,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
 
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
+    let obey_robots = args.obey_robots;
 
     match args.command {
         Some(Command::Serve {
@@ -364,6 +411,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             allow_file_access,
             storage_dir,
+            font_dirs,
             quiet: _,
         }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
@@ -374,6 +422,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+            configure_font_directories(&font_dirs)?;
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -383,6 +432,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
+            }
+            for directory in &font_dirs {
+                tracing::info!("Font dir: {}", directory.display());
             }
             if stealth {
                 #[cfg(feature = "stealth")]
@@ -395,7 +447,16 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(
+                    port,
+                    host,
+                    workers,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    font_dirs,
+                )
+                .await?;
             } else {
                 obscura_cdp::start_with_serve_options_and_limit(
                     port,
@@ -451,6 +512,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
+                    stealth
                 )
                 .await?;
             } else {
@@ -476,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     storage_dir,
                     args.allow_private_network,
+                    obey_robots,
                     screenshot,
                 )
                 .await?;
@@ -498,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
                 quiet,
                 global_proxy,
                 stealth,
+                obey_robots,
             )
             .await?;
         }
@@ -534,17 +598,36 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    font_dirs: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     let exe = std::env::current_exe()?;
+    // Claim the public port before starting children so another process cannot
+    // take it during worker startup.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    // Internal worker ports are implementation details. Asking the OS for
+    // free ports avoids assuming that every port adjacent to the public one is
+    // available (or that `port + workers` cannot overflow).
+    let mut reservations = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let worker_port = reservation.local_addr()?.port();
+        reservations.push((worker_port, reservation));
+    }
     let mut children = Vec::new();
+    let mut worker_ports = Vec::with_capacity(workers as usize);
 
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
+    for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
+        drop(reservation);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Workers receive the client-facing Host header through the TCP
+        // load balancer. Let their CDP security gate accept that public port
+        // while it continues to reject foreign hosts and browser origins.
+        cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host);
+        cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -555,6 +638,9 @@ async fn run_multi_worker_serve(
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
         }
+        for directory in &font_dirs {
+            cmd.arg("--font-dir").arg(directory);
+        }
         if stealth {
             cmd.arg("--stealth");
         }
@@ -562,41 +648,86 @@ async fn run_multi_worker_serve(
         cmd.stderr(std::process::Stdio::null());
 
         let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
+        tracing::info!("Worker {} on port {}", index + 1, worker_port);
         children.push(child);
+        worker_ports.push(worker_port);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait only until every worker has bound its control port. The old fixed
+    // 500 ms sleep dominated multi-worker startup even when workers were ready
+    // in a few milliseconds.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    for (index, (child, &worker_port)) in children.iter_mut().zip(&worker_ports).enumerate() {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("worker {} exited during startup: {}", index + 1, status);
+            }
+            match TcpStream::connect(("127.0.0.1", worker_port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
+    // The load balancer is bound to the requested host, not hardcoded loopback.
     // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
     // all interfaces; the multi-worker balancer must too, or the mapped port is
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
 
-    let mut next_worker: u16 = 0;
+    let mut next_worker = 0usize;
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
+        if let Err(error) = client_stream.set_nodelay(true) {
+            tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
+        }
+        let worker_port = worker_ports[next_worker % worker_ports.len()];
         next_worker = next_worker.wrapping_add(1);
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
         let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+        match client_stream.peek(&mut peek_buf).await {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                continue;
+            }
+        }
 
         if &peek_buf == b"GET " {
             let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
+            let n = match client_stream.peek(&mut full_peek).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                    continue;
+                }
+            };
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
                 let worker_addr = format!("127.0.0.1:{}", worker_port);
                 match tokio::net::TcpStream::connect(&worker_addr).await {
                     Ok(mut worker_stream) => {
+                        if let Err(error) = worker_stream.set_nodelay(true) {
+                            tracing::warn!(
+                                "worker {} TCP_NODELAY failed: {}",
+                                worker_addr,
+                                error
+                            );
+                        }
                         tokio::spawn(async move {
                             let std_stream = match client_stream.into_std() {
                                 Ok(s) => s,
@@ -641,6 +772,10 @@ async fn run_multi_worker_serve(
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
+                    if let Err(error) = worker_stream.set_nodelay(true) {
+                        tracing::warn!("worker {} TCP_NODELAY failed: {}", worker_addr, error);
+                        return;
+                    }
                     let mut client = client_stream;
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
@@ -686,6 +821,7 @@ async fn run_fetch(
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
@@ -699,19 +835,28 @@ async fn run_fetch(
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(url_str, proxy, user_agent.clone(), timeout_secs).await?;
+        let bytes = fetch_original_bytes(
+            url_str,
+            proxy,
+            user_agent.clone(),
+            timeout_secs,
+            stealth,
+        )
+        .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_storage_and_network(
+    let mut context = BrowserContext::with_storage_and_network(
         "fetch".to_string(),
         proxy,
         stealth,
         user_agent.clone(),
         storage_dir.clone(),
         allow_private_network,
-    ));
+    );
+    context.obey_robots = obey_robots;
+    let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
     // request deadline. Previously Page retained its independent 30s default,
@@ -1078,9 +1223,38 @@ async fn fetch_original_response(
     proxy: Option<String>,
     user_agent: Option<String>,
     timeout_secs: u64,
+    stealth: bool,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
+
+    // `--dump original` short-circuits the browser stack (see run_fetch) and
+    // builds its own client here instead of going through BrowserContext /
+    // Page::do_fetch, which is where --stealth is normally applied. Without
+    // this, the request stays on plain HTTP/1.1 with no TLS impersonation
+    // regardless of --stealth (issue #482). file:// has no TLS handshake to
+    // impersonate and the wreq client only speaks http(s), so it is excluded
+    // here the same way ObscuraHttpClient::fetch_with_method excludes it
+    // internally.
+    if stealth && url.scheme() != "file" {
+        #[cfg(feature = "stealth")]
+        {
+            // `false` matches the reqwest path below (`with_options`); the
+            // CLI mirrors --allow-private-network into
+            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
+            // honours.
+            let client = obscura_net::StealthHttpClient::with_proxy(
+                Arc::new(obscura_net::CookieJar::new()),
+                proxy.as_deref(),
+                false,
+            );
+            return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+            };
+        }
+    }
 
     let client = obscura_net::ObscuraHttpClient::with_options(
         Arc::new(obscura_net::CookieJar::new()),
@@ -1102,9 +1276,10 @@ async fn fetch_original_bytes(
     proxy: Option<String>,
     user_agent: Option<String>,
     timeout_secs: u64,
+    stealth: bool,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, user_agent, timeout_secs)
+        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth)
             .await?
             .body,
     )
@@ -1146,6 +1321,7 @@ async fn run_batch_fetch(
     proxy: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
+    stealth: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1178,6 +1354,7 @@ async fn run_batch_fetch(
                 (*proxy).clone(),
                 (*user_agent).clone(),
                 timeout_secs,
+                stealth,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -1353,6 +1530,28 @@ fn dump_markdown(page: &mut Page) -> String {
     result.as_str().unwrap_or_default().to_string()
 }
 
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+fn append_readable_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
@@ -1372,6 +1571,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
     const MAX_NODES: usize = 5_000_000;
 
     let mut result = String::new();
+    let mut pending_space = false;
     let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
     let mut visited = 0usize;
 
@@ -1379,6 +1579,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
         let id = match work {
             Work::Newline => {
                 result.push('\n');
+                pending_space = false;
                 continue;
             }
             Work::Visit(id) => id,
@@ -1396,10 +1597,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
         match &node.data {
             NodeData::Text { contents } => {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    result.push_str(trimmed);
-                }
+                append_readable_text_segment(&mut result, &mut pending_space, contents);
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
@@ -1452,6 +1650,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
                 if is_block {
                     result.push('\n');
+                    pending_space = false;
                     // Processed after all children (stack is LIFO): the trailing newline.
                     stack.push(Work::Newline);
                 }
@@ -1480,6 +1679,7 @@ async fn run_parallel_scrape(
     quiet: bool,
     proxy: Option<String>,
     stealth: bool,
+    obey_robots: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1537,6 +1737,7 @@ async fn run_parallel_scrape(
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
+                .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .spawn()
             {
                 Ok(c) => c,
@@ -1996,7 +2197,7 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5)
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, false)
             .await
             .expect("fetch_original_bytes should round-trip the file body");
 
@@ -2006,6 +2207,39 @@ mod tests {
             bytes, PNG_BYTES,
             "raw response body must match the file byte-for-byte"
         );
+    }
+
+    // A stealth-enabled build routes `--dump original` through
+    // StealthHttpClient (wreq), which only speaks http(s). file:// must keep
+    // working the same as without --stealth instead of being handed to wreq
+    // (issue #482).
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_original_bytes_file_url_ignores_stealth_flag() {
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-original-stealth-test-{}.png",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        tokio::fs::write(&path, PNG_BYTES)
+            .await
+            .expect("seed temp PNG fixture");
+
+        let file_url = format!("file://{}", path.display());
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, true)
+            .await
+            .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
+
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(bytes, PNG_BYTES, "stealth=true must not change file:// handling");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2092,6 +2326,29 @@ mod tests {
     fn parsed_serve_command_is_not_quiet() {
         let args = Args::try_parse_from(["obscura", "serve"]).expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--font-dir",
+            "/fonts/cjk",
+            "--font-dir",
+            "/fonts/brand",
+        ])
+        .expect("clap should accept repeatable --font-dir");
+        match args.command {
+            Some(Command::Serve { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [
+                    std::path::PathBuf::from("/fonts/cjk"),
+                    std::path::PathBuf::from("/fonts/brand"),
+                ]
+            ),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

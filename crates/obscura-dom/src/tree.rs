@@ -2,6 +2,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -248,11 +249,32 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+}
+
+/// Live control state is separate from content attributes and serialization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormControlState {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub indeterminate: bool,
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    form_controls: HashMap<NodeId, FormControlState>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -284,6 +306,8 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                form_controls: HashMap::new(),
+                external_stylesheets: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -294,6 +318,114 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+            },
+        );
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner
+            .borrow_mut()
+            .external_stylesheets
+            .remove(&owner)
+            .is_some()
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
+    }
+
+    pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
+        self.inner.borrow().form_controls.get(&node).cloned()
+    }
+
+    pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            == Some(value)
+    }
+
+    pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.checked)
+    }
+
+    pub fn form_control_indeterminate(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {
+            update(inner.form_controls.entry(node).or_default());
+        }
     }
 
     /// Record whether the document was parsed in (full) quirks mode.
@@ -318,6 +450,7 @@ impl DomTree {
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
     }
+
 
     /// Create and attach a native shadow-root node to `host`.
     pub fn attach_shadow_root(
@@ -911,6 +1044,7 @@ impl DomTree {
         // same NodeId to two live nodes (aliasing).
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.form_controls.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -976,6 +1110,13 @@ impl DomTree {
             .and_then(|n| n.first_child);
         while let Some(child_id) = current {
             result.push(child_id);
+            // Defense in depth: a valid sibling chain is at most nodes.len()
+            // long. Exceeding that means next_sibling forms a cycle (which the
+            // append_child / insert_before guards prevent); stop rather than
+            // loop forever. On a valid tree this bound is never reached.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
@@ -1287,6 +1428,12 @@ impl DomTree {
             .and_then(|n| n.parent);
         while let Some(parent_id) = current {
             result.push(parent_id);
+            // Defense in depth: a valid parent chain is at most nodes.len()
+            // long. Exceeding that means parent forms a cycle (which the
+            // reparenting guards prevent); stop rather than loop forever.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.parent);
@@ -1397,7 +1544,7 @@ impl DomTree {
     pub fn import_children_from(&self, parent_id: NodeId, source: &DomTree, source_node: NodeId) {
         let source_children = source.children(source_node);
         for source_child_id in source_children {
-            self.import_node_from(parent_id, source, source_child_id);
+            let _ = self.import_node_from(parent_id, source, source_child_id);
         }
     }
 
@@ -1417,6 +1564,10 @@ impl DomTree {
         }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
+        if let Some(mut state) = self.form_control_state(source_node_id) {
+            state.indeterminate = false;
+            self.update_form_control_state(cloned_root, |control| *control = state);
+        }
         let mut stack = Vec::new();
         self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
 
@@ -1426,6 +1577,10 @@ impl DomTree {
                 None => continue,
             };
             let cloned_node = self.new_node(source_data);
+            if let Some(mut state) = self.form_control_state(source_node) {
+                state.indeterminate = false;
+                self.update_form_control_state(cloned_node, |control| *control = state);
+            }
             self.append_child(dest_parent, cloned_node);
             self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
         }
@@ -1468,12 +1623,21 @@ impl DomTree {
         }
     }
 
-    fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
+    /// Copies a node together with its subtree from `source` and attaches it to `parent_id`.
+    /// Returns the copy of `source_node_id` itself, so that a caller that keeps parsing into
+    /// `source` can map the source to its copy.
+    pub fn import_node_from(
+        &self,
+        parent_id: NodeId,
+        source: &DomTree,
+        source_node_id: NodeId,
+    ) -> Option<NodeId> {
         // Iterative DFS with an explicit (dest_parent, source_node) stack so a
         // deeply nested source tree cannot overflow the thread stack and abort
         // the process. Children are pushed in reverse so they are appended in
         // document order (append_child always appends to the end, so each level
         // keeps the source ordering).
+        let mut imported_root = None;
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
             let node_data = {
@@ -1486,6 +1650,10 @@ impl DomTree {
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
+            // The first node off the stack is source_node_id itself.
+            if imported_root.is_none() {
+                imported_root = Some(new_id);
+            }
 
             // A <template>'s children hang off a separate contents document, so
             // the child walk below never reaches them. Worse, the cloned data
@@ -1523,6 +1691,7 @@ impl DomTree {
                 stack.push((new_id, child_id));
             }
         }
+        imported_root
     }
 
     pub fn len(&self) -> usize {
@@ -2242,5 +2411,76 @@ mod tests {
         dest.import_children_from(dest_doc, &source, source.document());
 
         assert!(dest.len() >= 100_000);
+    }
+
+    /// SEC-008 / #582 — children() must terminate on a corrupted cyclic sibling
+    /// chain, the same way descendants() already does. The public mutation API
+    /// cannot create such a cycle, so we forge one by writing the node arena
+    /// directly, then assert the walk stays bounded instead of hanging forever.
+    #[test]
+    fn children_walk_is_bounded_on_corrupted_sibling_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let a = mk("a");
+        let b = mk("b");
+        tree.append_child(doc, root);
+        tree.append_child(root, a);
+        tree.append_child(root, b);
+
+        // Forge a sibling cycle a -> a that append_child never produces.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[a.index()].as_mut().unwrap().next_sibling = Some(a);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let kids = tree.children(root);
+        assert!(
+            kids.len() <= node_count + 1,
+            "children() must stay bounded on a cyclic sibling chain, got {}",
+            kids.len()
+        );
+    }
+
+    /// SEC-008 / #582 — ancestors() companion to the children() cycle test.
+    #[test]
+    fn ancestors_walk_is_bounded_on_corrupted_parent_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let child = mk("child");
+        tree.append_child(doc, root);
+        tree.append_child(root, child);
+
+        // Forge a parent cycle child -> child.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[child.index()].as_mut().unwrap().parent = Some(child);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let ancestors = tree.ancestors(child);
+        assert!(
+            ancestors.len() <= node_count + 1,
+            "ancestors() must stay bounded on a cyclic parent chain, got {}",
+            ancestors.len()
+        );
     }
 }

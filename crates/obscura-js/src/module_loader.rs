@@ -4,12 +4,15 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use deno_core::error::ModuleLoaderError;
+use deno_core::ModuleLoadOptions;
+use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoadResponse;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
-use deno_core::RequestedModuleType;
+
+use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
 use crate::ops::ObscuraState;
@@ -146,7 +149,7 @@ impl ObscuraModuleLoader {
 }
 
 fn io_err(msg: String) -> ModuleLoaderError {
-    std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+    JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
 impl ModuleLoader for ObscuraModuleLoader {
@@ -162,7 +165,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // must not remap that root URL.
         if referrer == "." {
             return deno_core::resolve_import(specifier, &self.base_url)
-                .map_err(|error| error.into());
+                .map_err(|error| io_err(error.to_string()));
         }
 
         let base = if referrer.is_empty()
@@ -186,9 +189,8 @@ impl ModuleLoader for ObscuraModuleLoader {
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        maybe_referrer: Option<&ModuleSpecifier>,
-        is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        maybe_referrer: Option<&ModuleLoadReferrer>,
+        options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
         // Module-graph CORS and same-origin credentials are relative to the
@@ -199,7 +201,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         let document_url = ModuleSpecifier::parse(&self.base_url)
             .unwrap_or_else(|_| module_specifier.clone());
         let referrer = maybe_referrer
-            .cloned()
+            .map(|referrer| referrer.specifier.clone())
             .unwrap_or_else(|| document_url.clone());
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
@@ -211,6 +213,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
+        let is_dyn_import = options.is_dynamic_import;
         let activity_guard = is_dyn_import.then(|| activity.begin());
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
@@ -224,17 +227,33 @@ impl ModuleLoader for ObscuraModuleLoader {
                     .http_client
                     .clone()
                     .ok_or_else(|| "No http_client wired to module loader".to_string())?;
-                Ok((client, state.callbacks.clone()))
+                // Fork: in stealth mode an ES module must be fetched over the
+                // same transport as the document. Upstream sends it through the
+                // plain reqwest client, so a `type="module"` script arrives with
+                // a different TLS fingerprint and none of the browser identity
+                // headers, while the HTML that referenced it came over wreq.
+                // That cross-transport mismatch is trivially detectable.
+                #[cfg(feature = "stealth")]
+                let stealth = state.stealth_client.clone();
+                #[cfg(not(feature = "stealth"))]
+                let stealth: Option<std::sync::Arc<()>> = None;
+                Ok((client, stealth, state.callbacks.clone()))
             })(),
             None => self
                 .standalone_client
                 .clone()
-                .map(|client| (client, None))
+                .map(|client| {
+                    #[cfg(feature = "stealth")]
+                    let stealth = None;
+                    #[cfg(not(feature = "stealth"))]
+                    let stealth: Option<std::sync::Arc<()>> = None;
+                    (client, stealth, None)
+                })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            // deno_core propagates `is_dyn_import` to every dependency edge in
+            // deno_core propagates `is_dynamic_import` to every dependency edge in
             // the recursive graph, so this excludes parser-discovered/static
             // graphs without losing descendant fetches of a lazy graph.
             let _activity_guard = activity_guard;
@@ -245,17 +264,43 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, callbacks)) => {
+                Ok((client, stealth, callbacks)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    let resp = client
-                        .fetch_resource_with_callbacks(
-                            &requested,
-                            obscura_net::ResourceRequest::module_script(&document_url, &referrer),
-                            callbacks.as_deref(),
-                        )
-                        .await
-                        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    let request =
+                        obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    #[cfg(feature = "stealth")]
+                    let resp = match stealth {
+                        Some(stealth) => stealth
+                            .fetch_resource_with_callbacks(
+                                &requested,
+                                request,
+                                callbacks.as_deref(),
+                            )
+                            .await,
+                        None => {
+                            client
+                                .fetch_resource_with_callbacks(
+                                    &requested,
+                                    request,
+                                    callbacks.as_deref(),
+                                )
+                                .await
+                        }
+                    }
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    #[cfg(not(feature = "stealth"))]
+                    let resp = {
+                        let _ = &stealth;
+                        client
+                            .fetch_resource_with_callbacks(
+                                &requested,
+                                request,
+                                callbacks.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                    };
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",

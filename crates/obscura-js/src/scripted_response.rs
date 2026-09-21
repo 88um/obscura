@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use base64::Engine as _;
 
 use crate::ops::{JsNetworkEvent, SharedState, StoredNetworkResponseBody};
 
@@ -6,7 +7,7 @@ pub(crate) struct ScriptedResponse<'a> {
     pub url: &'a str,
     pub method: &'a str,
     pub request_headers: &'a HashMap<String, String>,
-    pub request_body: &'a str,
+    pub request_body: &'a [u8],
     pub status: u16,
     pub headers: &'a HashMap<String, String>,
     pub body: &'a [u8],
@@ -36,8 +37,11 @@ pub(crate) fn record_scripted_response(
         state.network_response_bodies.insert(
             request_id.clone(),
             StoredNetworkResponseBody {
-                body: String::from_utf8_lossy(response.body).to_string(),
-                base64_encoded: false,
+                body: match std::str::from_utf8(response.body) {
+                    Ok(text) => text.to_owned(),
+                    Err(_) => base64::engine::general_purpose::STANDARD.encode(response.body),
+                },
+                base64_encoded: std::str::from_utf8(response.body).is_err(),
             },
         );
         state
@@ -55,7 +59,8 @@ pub(crate) fn record_scripted_response(
         method: response.method.to_string(),
         status: response.status,
         request_headers: response.request_headers.clone(),
-        post_data: (!response.request_body.is_empty()).then(|| response.request_body.to_string()),
+        post_data_bytes: (!response.request_body.is_empty()).then(|| response.request_body.to_vec()),
+        post_data: (!response.request_body.is_empty()).then(|| String::from_utf8_lossy(response.request_body).into_owned()),
         response_headers: response.headers.clone(),
         body_size: response.body.len(),
         timestamp: std::time::SystemTime::now()
@@ -69,4 +74,31 @@ pub(crate) fn record_scripted_response(
         state.js_network_events.drain(0..overflow);
     }
     request_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intercepted_binary_response_keeps_id_and_exact_request_and_response_bytes() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(crate::ops::ObscuraState::new()));
+        let headers = HashMap::new();
+        let id = record_scripted_response(&state, Some("intercept-7".into()), ScriptedResponse {
+            url: "https://example.test/upload",
+            method: "POST",
+            request_headers: &headers,
+            request_body: &[0, 255, 128],
+            status: 200,
+            headers: &headers,
+            body: &[255, 0, 128],
+        });
+        assert_eq!(id, "intercept-7");
+        let state = state.borrow();
+        let body = &state.network_response_bodies[&id];
+        assert!(body.base64_encoded);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&body.body).unwrap(), [255, 0, 128]);
+        assert_eq!(state.js_network_events[0].request_id, id);
+        assert_eq!(state.js_network_events[0].post_data_bytes.as_deref(), Some([0, 255, 128].as_slice()));
+    }
 }
