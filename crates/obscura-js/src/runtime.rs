@@ -1371,6 +1371,15 @@ impl ObscuraJsRuntime {
             .cloned()
     }
 
+    /// Move retained bodies in completion order before the runtime is suspended.
+    pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
+        let mut state = self.state.borrow_mut();
+        let order = std::mem::take(&mut state.network_response_body_order);
+        order.into_iter().filter_map(|id| {
+            state.network_response_bodies.remove(&id).map(|body| (id, body))
+        }).collect()
+    }
+
     pub fn clear_network_response_bodies(&self) {
         let mut state = self.state.borrow_mut();
         state.network_response_bodies.clear();

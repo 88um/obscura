@@ -4674,6 +4674,19 @@ impl Page {
         }
         // Completed module and JS requests must survive the realm's teardown.
         self.sync_js_network_events();
+        let max_entries = response_body_entry_limit();
+        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), StoredResponseBody {
+                body: body.body,
+                base64_encoded: body.base64_encoded,
+            });
+            self.response_body_order.push_back(id);
+        }
+        while self.response_body_order.len() > max_entries {
+            if let Some(oldest) = self.response_body_order.pop_front() {
+                self.response_bodies.remove(&oldest);
+            }
+        }
         // Suspension rebuilds the renderer cache on resume (`take_dom`), so
         // results for the suspended realm would have nowhere to go.
         self.retire_render_resources();

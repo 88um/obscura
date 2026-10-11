@@ -111,20 +111,23 @@ async fn static_graph(stealth: bool) {
     const ROOT: &str = "import '/child.js'; globalThis.rootRuns=(globalThis.rootRuns||0)+1;";
     const CHILD: &str = "globalThis.childRuns=(globalThis.childRuns||0)+1;";
     const ASYNC: &str = "globalThis.asyncRan=true;";
+    const CLASSIC: &str = "globalThis.classicRan=true;";
     let base = serve(vec![
-        ("/", 200, "", b"<script type='module' src='/root.js'></script><script type='module' src='/child.js'></script><script type='module' src='/root.js'></script><script type='module' async src='/async.js'></script>"),
+        ("/", 200, "", b"<script src='/classic.js'></script><script type='module' src='/root.js'></script><script type='module' src='/child.js'></script><script type='module' src='/root.js'></script><script type='module' async src='/async.js'></script>"),
         ("/root.js", 201, "Content-Disposition: attachment\r\n", ROOT.as_bytes()),
         ("/child.js", 200, "", CHILD.as_bytes()),
         ("/async.js", 200, "", ASYNC.as_bytes()),
+        ("/classic.js", 200, "Content-Disposition: attachment\r\n", CLASSIC.as_bytes()),
     ]).await;
     let mut ctx = navigate(&base, stealth).await;
     let result = cdp(&mut ctx, "Runtime.evaluate", json!({
-        "expression": "[globalThis.rootRuns,globalThis.childRuns,globalThis.asyncRan]", "returnByValue": true,
+        "expression": "[globalThis.rootRuns,globalThis.childRuns,globalThis.asyncRan,globalThis.classicRan]", "returnByValue": true,
     })).await;
-    assert_eq!(result["result"]["value"], json!([1,1,true]));
+    assert_eq!(result["result"]["value"], json!([1,1,true,true]));
     assert_module(&mut ctx, &base, "/root.js", 201, ROOT).await;
     assert_module(&mut ctx, &base, "/child.js", 200, CHILD).await;
     assert_module(&mut ctx, &base, "/async.js", 200, ASYNC).await;
+    assert_module(&mut ctx, &base, "/classic.js", 200, CLASSIC).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -250,10 +253,57 @@ async fn module_records_survive_page_runtime_suspension() {
     page.evaluate("import('/lazy.js')");
     page.settle_for_duration(100).await;
     assert_eq!(page.evaluate("globalThis.lazyRan"), json!(true));
+    page.sync_js_network_events();
+    let bodies = [
+        ("/root.js", "import '/child.js';"),
+        ("/child.js", "globalThis.childRan=true;"),
+        ("/lazy.js", "globalThis.lazyRan=true;"),
+    ].map(|(path, body)| {
+        let id = page.network_events.iter().find(|e| e.url == format!("{base}{path}"))
+            .unwrap().request_id.clone();
+        assert_eq!(page.get_response_body(&id).unwrap().body, body);
+        (id, body)
+    });
     page.suspend_js();
     for path in ["/root.js", "/child.js", "/lazy.js"] {
         assert_eq!(page.network_events.iter().filter(|e| e.url == format!("{base}{path}") && e.body_size > 0).count(), 1);
     }
+    for (id, body) in &bodies {
+        assert_eq!(page.get_response_body(id).map(|b| b.body), Some(body.to_string()),
+            "retained body must survive runtime suspension: {id}");
+    }
+    page.resume_js();
+    page.suspend_js();
+    for (id, body) in &bodies {
+        assert_eq!(page.get_response_body(id).map(|b| b.body), Some(body.to_string()),
+            "resuming must not discard retained bodies: {id}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn suspension_enforces_combined_response_body_entry_limit() {
+    let _env = EnvOverride::set("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "1");
+    const ROOT: &str = "import '/child.js';";
+    const CHILD: &str = "export const ready=true;";
+    let base = serve(vec![
+        ("/", 200, "", b"<script type='module' src='/root.js'></script>"),
+        ("/root.js", 200, "", ROOT.as_bytes()),
+        ("/child.js", 200, "", CHILD.as_bytes()),
+    ]).await;
+    let mut ctx = navigate(&base, false).await;
+    let root = module_request_id(&ctx, &format!("{base}/root.js"), 200, ROOT.len());
+    let child = module_request_id(&ctx, &format!("{base}/child.js"), 200, CHILD.len());
+    let document = ctx.pending_events.iter()
+        .find(|e| e.method == "Network.responseReceived" && e.params["type"] == "Document")
+        .unwrap().params["requestId"].as_str().unwrap().to_string();
+    let page = &mut ctx.pages[0];
+    assert!(page.get_response_body(&document).is_some());
+    assert!(page.get_response_body(&root).is_none());
+    assert_eq!(page.get_response_body(&child).unwrap().body, CHILD);
+    page.suspend_js();
+    assert!(page.get_response_body(&document).is_none(), "older page cache entry must be evicted");
+    assert!(page.get_response_body(&root).is_none(), "evicted runtime entry must not reappear");
+    assert_eq!(page.get_response_body(&child).map(|b| b.body), Some(CHILD.to_string()));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -283,4 +333,8 @@ async fn module_body_buffer_preserves_non_utf8_bytes() {
     assert_eq!(stored, json!({
         "body": base64::engine::general_purpose::STANDARD.encode(BODY), "base64Encoded": true,
     }));
+    ctx.pages[0].suspend_js();
+    let retained = ctx.pages[0].get_response_body(&id).unwrap();
+    assert!(retained.base64_encoded);
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(retained.body).unwrap(), BODY);
 }
