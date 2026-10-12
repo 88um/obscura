@@ -4755,6 +4755,14 @@ impl Page {
             .is_some_and(|js| js.has_pending_navigation())
     }
 
+    /// Discard a queued document navigation and cancel retained resource loads.
+    /// The CDP processor separately cancels its borrowed navigation future.
+    pub fn stop_loading(&mut self) {
+        self.take_pending_navigation();
+        #[cfg(feature = "render")]
+        if let Some(js) = &mut self.js { js.stop_render_resource_loading(); }
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         if let Some(js) = &self.js {
             js.take_pending_binding_calls()

@@ -64,6 +64,7 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -178,6 +179,7 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
+            pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -331,6 +333,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()

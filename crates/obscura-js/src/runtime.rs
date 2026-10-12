@@ -1253,6 +1253,10 @@ impl ObscuraJsRuntime {
         }
     }
 
+    pub fn document_url(&self) -> String {
+        self.state.borrow().url.clone()
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -2099,6 +2103,29 @@ impl ObscuraJsRuntime {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         state.render_resource_tx = tx;
         state.render_resource_rx = rx;
+    }
+
+    /// Cancel this document's current loads without letting the next render
+    /// turn rediscover and restart them. Future new URLs can still load.
+    #[cfg(feature = "render")]
+    pub fn stop_render_resource_loading(&mut self) {
+        self.service_render_resources();
+        let (pending, backlog, queued, images) = {
+            let mut state = self.state.borrow_mut();
+            (std::mem::take(&mut state.render_resource_in_flight),
+                std::mem::take(&mut state.render_resource_backlog),
+                state.render_resources.take_sync_misses(),
+                std::mem::take(&mut state.render_image_in_flight))
+        };
+        self.abandon_render_resources();
+        let mut state = self.state.borrow_mut();
+        for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
+            state.render_resources.stop_resource(&url, profile);
+        }
+        for ((_, url, profile), (cancel, _)) in images {
+            state.render_resources.stop_resource(&url, Some(profile));
+            let _ = cancel.send(());
+        }
     }
 
     /// Whether a page transport (plain or stealth client) is installed.
@@ -4193,16 +4220,23 @@ impl ObscuraJsRuntime {
 
         for (i, arg) in arguments.iter().enumerate() {
             let arg_name = format!("__arg{}", i);
-            if let Some(value) = arg.get("value") {
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
+            // objectId wins over value. go-rod marshals CallArgument through a
+            // struct, and Go's `omitempty` is a no-op on structs, so every
+            // object handle it sends arrives as `{"value":null,"objectId":...}`.
+            // Chromium reads objectId first and ignores the null; reading value
+            // first passed `null` as the argument and broke rod's JS helpers
+            // (`functions.selectable = ...` → "Cannot set properties of null").
+            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
                 }
+            } else if let Some(value) = arg.get("value") {
+                // No handle: a plain JSON argument, explicit null included.
+                let json_str =
+                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
+                setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
                 // CDP defines UnserializableValue as a closed set. Anything
                 // else is arbitrary source text arriving in a data field;
