@@ -8664,6 +8664,31 @@ mod tests {
     }
 
     #[test]
+    fn iframe_brand_does_not_match_other_elements() {
+        // style-loader resolves its insert target with
+        // `found instanceof HTMLIFrameElement ? found.contentDocument.head : found`;
+        // with the interface aliased to Element, <head> took the iframe branch.
+        let mut rt = setup_runtime(
+            r#"<html><head></head><body><iframe id="frame"></iframe><div id="plain"></div></body></html>"#,
+        );
+        let result = rt.evaluate(r#"
+            const frame = document.getElementById('frame');
+            const created = document.createElement('iframe');
+            const nodes = [document.head, document.documentElement, document.body,
+                document.getElementById('plain'), document.createElement('div'),
+                document.createElementNS('urn:test', 'IFRAME')];
+            return [frame instanceof HTMLIFrameElement, created instanceof HTMLIFrameElement,
+                frame.cloneNode() instanceof HTMLIFrameElement,
+                frame instanceof HTMLElement && frame instanceof Element,
+                nodes.map(node => node instanceof HTMLIFrameElement)];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, true, true, true,
+            [false, false, false, false, false, false]
+        ]));
+    }
+
+    #[test]
     fn meta_http_equiv_reflection_supports_snapshot_csp_filtering() {
         let mut rt = setup_runtime(
             r#"<html><head><meta id="plain" charset="utf-8">

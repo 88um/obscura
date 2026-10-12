@@ -7091,6 +7091,10 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLSlotElement;
   }
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLIFrameElement;
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7114,6 +7118,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
+    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -13112,7 +13117,11 @@ for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype])
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
 }
 globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
+// <iframe> needs its own brand: with `HTMLIFrameElement = Element` every
+// element passed `instanceof HTMLIFrameElement`, so style-loader's
+// "insert target is an iframe" branch took `contentDocument.head` of <head>
+// itself and failed with "Couldn't find a style target".
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
