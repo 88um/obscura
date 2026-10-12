@@ -180,3 +180,9 @@ second navigation. Request IDs and loader IDs match the driving session, so
 `Network.getResponseBody` uses the same ID. Fetch interception control and the
 navigation lifecycle keep their existing owner; sessions on other targets do
 not receive this traffic.
+
+ES-module roots, dependencies, and dynamic imports report their actual HTTP
+status, response headers, and body size. Retained bodies remain readable by
+request ID when a page's JavaScript runtime is suspended, subject to
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
+Cached imports do not produce another network request.

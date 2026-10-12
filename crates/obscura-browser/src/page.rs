@@ -2839,14 +2839,6 @@ impl Page {
                             tracing::warn!("ES module evaluation error: {}", error);
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
-                            self.record_network_event(
-                                &url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -2927,14 +2919,6 @@ impl Page {
                         tracing::warn!("ES module evaluation error: {}", error);
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
-                        self.record_network_event(
-                            &url,
-                            "GET",
-                            "Script",
-                            200,
-                            &std::collections::HashMap::new(),
-                            0,
-                        );
                     }
                 }
             }
@@ -2991,6 +2975,7 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        self.sync_js_network_events();
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -4532,25 +4517,6 @@ impl Page {
         }
     }
 
-    fn record_network_event(
-        &mut self,
-        url: &str,
-        method: &str,
-        resource_type: &str,
-        status: u16,
-        response_headers: &std::collections::HashMap<String, String>,
-        body_size: usize,
-    ) {
-        self.record_network_event_inner(
-            url,
-            method,
-            resource_type,
-            status,
-            response_headers,
-            body_size,
-        );
-    }
-
     fn record_network_event_with_body(
         &mut self,
         url: &str,
@@ -4705,6 +4671,21 @@ impl Page {
     pub fn suspend_js(&mut self) {
         if self.js.is_none() {
             return;
+        }
+        // Completed module and JS requests must survive the realm's teardown.
+        self.sync_js_network_events();
+        let max_entries = response_body_entry_limit();
+        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), StoredResponseBody {
+                body: body.body,
+                base64_encoded: body.base64_encoded,
+            });
+            self.response_body_order.push_back(id);
+        }
+        while self.response_body_order.len() > max_entries {
+            if let Some(oldest) = self.response_body_order.pop_front() {
+                self.response_bodies.remove(&oldest);
+            }
         }
         // Suspension rebuilds the renderer cache on resume (`take_dom`), so
         // results for the suspended realm would have nowhere to go.
