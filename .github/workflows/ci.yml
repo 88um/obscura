@@ -160,7 +160,7 @@ jobs:
         run: |
           # rust-cache removes gn_out but can retain V8's build-script metadata.
           if [[ ! -f target/release/gn_out/obj/librusty_v8.a || ! -s target/release/gn_out/obj/librusty_v8.a ]]; then
-            rm -f -- target/release/gn_out/obj/librusty_v8.sum
+            rm -f -- target/release/gn_out/obj/librusty_v8.a target/release/gn_out/obj/librusty_v8.sum
             cargo clean --release -p v8
           fi
 
@@ -284,7 +284,7 @@ jobs:
         run: |
           # This checkout is the trusted base, so keep the repair self-contained.
           if [[ ! -f target/release/gn_out/obj/librusty_v8.a || ! -s target/release/gn_out/obj/librusty_v8.a ]]; then
-            rm -f -- target/release/gn_out/obj/librusty_v8.sum
+            rm -f -- target/release/gn_out/obj/librusty_v8.a target/release/gn_out/obj/librusty_v8.sum
             cargo clean --release -p v8
           fi
 
