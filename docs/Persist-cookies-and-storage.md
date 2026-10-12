@@ -17,9 +17,13 @@ obscura serve --storage-dir ./obscura-data
 
 All CDP sessions read and write to the same directory. Run separate `obscura serve` processes with different `--storage-dir` paths for isolated profiles.
 
-`--storage-dir` is a global flag, so it applies to `obscura mcp` as well. The MCP
-server picks it up from `OBSCURA_STORAGE_DIR`, which `obscura mcp` sets from the
-flag, and it flushes the profile on exit.
+For MCP, put the profile flag before the subcommand:
+
+```bash
+obscura --storage-dir ./obscura-data mcp
+```
+
+The MCP server also accepts `OBSCURA_STORAGE_DIR` and flushes the profile on exit.
 
 ## Layout
 
@@ -28,9 +32,8 @@ Inside `./obscura-data`:
 - `cookies.json`: cookie jar in a stable format with `same_site`, `expires`, `http_only`, `secure`.
 - `localStorage/<origin>-<digest>.json`: one file per origin, holding
   `{"origin": "...", "entries": [["key", "value"], ...]}`. The digest is an FNV-1a
-  hash of the origin, so two origins that sanitize to the same filename cannot
-  collide. Entries stay in insertion order because `Storage.key(i)` is defined
-  in insertion order.
+  hash of the origin, avoiding collisions caused by filename sanitization.
+  This implementation retains entries in insertion order.
 
 Inspect one with `jq`:
 
@@ -55,6 +58,18 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 is dropped when the tab goes away, the same as a real browser, but it does
 survive navigation and CDP target switching within the process
 ([#678](https://github.com/h4ckf0r0day/obscura/issues/678)).
+
+Web Storage is limited to 5 MiB per origin, 32 MiB per backing store and 256
+origins. Failed profile writes and removals stay pending for a later flush.
+The budgets count UTF-8 backing bytes. Strings containing unpaired UTF-16 units
+or starting with NUL use a NUL-prefixed JSON string escape internally, including
+in profile files; the JavaScript API decodes them losslessly. Normal strings are
+stored unchanged. Encoded strings consume more of the byte budget.
+Shared contexts serialize flushes with storage mutations. Use separate profile
+directories for independent browser processes; this is not a cross-process
+database. Opaque-origin documents cannot access either store.
+
+Automatic cross-document `storage` events are not implemented by this change.
 
 ## Login once, scrape many
 

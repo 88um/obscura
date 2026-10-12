@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use obscura_js::ops::{IndexedDbStorage, OriginStorage};
+use obscura_js::ops::OriginStorage;
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
@@ -11,9 +11,6 @@ pub struct BrowserContext {
     /// rather than by a V8 realm, so an entry written in one document is still
     /// there in the next (issue #678).
     pub local_storage: Arc<OriginStorage>,
-    /// IndexedDB records and schema, keyed by origin. Owned by the context, so
-    /// a page reload or a second tab sees the same databases.
-    pub indexed_db: Arc<IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -77,20 +74,32 @@ fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 
 /// Restore `{storage_dir}/localStorage/*.json` into a fresh store.
 fn load_web_storage(storage: &OriginStorage, dir: Option<&PathBuf>) {
+    use std::io::Read;
     let Some(dir) = dir else { return };
     let root = dir.join("localStorage");
     let Ok(read_dir) = std::fs::read_dir(&root) else { return };
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
-        let Ok(contents) = std::fs::read_to_string(&path) else {
+        // A 5 MiB store can expand sixfold when encoded as JSON escapes.
+        let mut contents = String::new();
+        let limit = 32 * 1024 * 1024;
+        let read = std::fs::File::open(&path).and_then(|file| file.take(limit + 1).read_to_string(&mut contents));
+        if read.is_err() || contents.len() as u64 > limit {
             tracing::warn!("Failed to read {}", path.display());
             continue;
-        };
+        }
         match serde_json::from_str::<StoredOriginStorage>(&contents) {
-            Ok(stored) => storage.load(&stored.origin, stored.entries),
+            Ok(stored) => {
+                let valid_origin = stored.origin == "file://" || url::Url::parse(&stored.origin)
+                    .is_ok_and(|url| url.origin().ascii_serialization() == stored.origin && stored.origin != "null");
+                if !valid_origin || !storage.load(&stored.origin, stored.entries) {
+                    tracing::warn!("Ignoring invalid or over-budget {}", path.display());
+                }
+            }
             Err(e) => tracing::warn!("Ignoring unreadable {}: {}", path.display(), e),
         }
     }
@@ -191,7 +200,6 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage,
-            indexed_db: Arc::new(IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -257,11 +265,6 @@ impl BrowserContext {
             } else {
                 Arc::new(OriginStorage::default())
             },
-            indexed_db: if persistent {
-                self.indexed_db.clone()
-            } else {
-                Arc::new(IndexedDbStorage::default())
-            },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),
@@ -289,34 +292,28 @@ impl BrowserContext {
         if !self.local_storage.is_dirty() {
             return;
         }
-        let changed = self.local_storage.changed_origins();
         let root = dir.join("localStorage");
         if let Err(e) = std::fs::create_dir_all(&root) {
             tracing::warn!("Failed to create {}: {}", root.display(), e);
             return;
         }
-        for origin in &changed {
+        self.local_storage.flush_changed(|origin, entries| {
             let path = root.join(format!("{}.json", storage_file_stem(origin)));
-            let entries = self.local_storage.snapshot(origin);
-            if entries.is_empty() {
+            let result = if entries.is_empty() {
                 match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!("Failed to remove {}: {}", path.display(), e),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
                 }
-                continue;
+            } else {
+                let stored = StoredOriginStorage { origin: origin.to_string(), entries: entries.to_vec() };
+                serde_json::to_vec(&stored).map_err(std::io::Error::other)
+                    .and_then(|bytes| write_file_atomically(&path, &bytes))
+            };
+            match result {
+                Ok(()) => true,
+                Err(e) => { tracing::warn!("Failed to persist {}: {}", path.display(), e); false }
             }
-            let stored = StoredOriginStorage { origin: origin.clone(), entries };
-            match serde_json::to_string(&stored) {
-                Ok(payload) => {
-                    if let Err(e) = write_file_atomically(&path, payload.as_bytes()) {
-                        tracing::warn!("Failed to save {}: {}", path.display(), e);
-                    }
-                }
-                Err(e) => tracing::warn!("Failed to encode localStorage: {}", e),
-            }
-        }
-        self.local_storage.take_changed();
+        });
     }
 
     /// Persist cookies and Web Storage if storage_dir is configured.
@@ -390,6 +387,123 @@ mod tests {
     /// --storage-dir has to survive a restart, which is the whole point of a
     /// profile: a second context over the same directory reads back what the
     /// first one wrote.
+    #[test]
+    fn local_storage_retries_failed_writes_without_rewriting_successes() {
+        let dir = temp_storage_dir("write-retry");
+        let context = BrowserContext::with_storage("write-retry".into(), Some(dir.clone()));
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let failed = root.join(format!("{}.json", storage_file_stem("https://failed.test")));
+        let blocked = failed.with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(context.local_storage.set("https://failed.test", "token".into(), "kept".into()));
+        assert!(context.local_storage.set("https://saved.test", "token".into(), "saved".into()));
+        context.save_local_storage();
+        assert!(context.local_storage.is_dirty(), "failed writes must remain retryable");
+        assert_eq!(context.local_storage.changed_origins(), vec!["https://failed.test"]);
+        std::fs::remove_dir(&blocked).unwrap();
+        context.save_local_storage();
+        assert!(!context.local_storage.is_dirty());
+        let reloaded = BrowserContext::with_storage("reloaded".into(), Some(dir.clone()));
+        assert_eq!(reloaded.local_storage.get("https://failed.test", "token").as_deref(), Some("kept"));
+        assert_eq!(reloaded.local_storage.get("https://saved.test", "token").as_deref(), Some("saved"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn local_storage_ignores_non_regular_profile_files() {
+        let dir = temp_storage_dir("non-regular");
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let pipe = root.join("blocked.json");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let profile = dir.clone();
+        let reader = std::thread::spawn(move || {
+            let context = BrowserContext::with_storage("reader".into(), Some(profile));
+            tx.send(context.local_storage.is_dirty()).unwrap();
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(2));
+        if completed.is_err() {
+            // Release the broken reader before reporting the failure.
+            std::fs::write(&pipe, b"{}").unwrap();
+        }
+        reader.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(completed.ok(), Some(false), "profile loading must not block on a FIFO");
+    }
+
+    #[test]
+    fn local_storage_retries_failed_deletions() {
+        let dir = temp_storage_dir("delete-retry");
+        let context = BrowserContext::with_storage("delete-retry".into(), Some(dir.clone()));
+        assert!(context.local_storage.set("https://app.test", "token".into(), "old".into()));
+        context.save_local_storage();
+        let path = dir.join("localStorage").join(format!("{}.json", storage_file_stem("https://app.test")));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        context.local_storage.clear("https://app.test");
+        context.save_local_storage();
+        assert!(context.local_storage.is_dirty(), "a failed deletion must not be acknowledged");
+        std::fs::remove_dir(&path).unwrap();
+        context.save_local_storage();
+        assert!(!context.local_storage.is_dirty());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_storage_retries_mutations_made_during_a_flush() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        let dir = temp_storage_dir("concurrent-flush");
+        let context = Arc::new(BrowserContext::with_storage("writer".into(), Some(dir.clone())));
+        let other = context.isolated_copy("mutator".into(), true);
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{}.json", storage_file_stem("https://app.test")));
+        let pipe = path.with_extension("json.tmp");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let old = "x".repeat(64 * 1024);
+        assert!(context.local_storage.set("https://app.test", "token".into(), old.clone()));
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::open(pipe).unwrap();
+            opened_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let writer_context = context.clone();
+        let writer = std::thread::spawn(move || writer_context.save_local_storage());
+        opened_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let mutator = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            assert!(other.local_storage.set("https://app.test", "token".into(), "latest".into()));
+            changed_tx.send(()).unwrap();
+        });
+        attempted_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // Let the old unlocked writer lose a mutation while its FIFO is held.
+        // A serialized writer keeps the mutation blocked until the flush ends.
+        let _ = changed_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        mutator.join().unwrap();
+        let written: StoredOriginStorage = serde_json::from_slice(&reader.join().unwrap()).unwrap();
+        assert_eq!(written.entries, vec![("token".into(), old)]);
+        assert!(context.local_storage.is_dirty(), "a newer mutation must survive the older flush acknowledgement");
+        context.save_local_storage();
+        let reloaded = BrowserContext::with_storage("reloaded".into(), Some(dir.clone()));
+        assert_eq!(reloaded.local_storage.get("https://app.test", "token").as_deref(), Some("latest"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn local_storage_round_trips_through_the_storage_dir() {
         let dir = temp_storage_dir("roundtrip");

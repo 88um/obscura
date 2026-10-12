@@ -1842,7 +1842,6 @@ impl Page {
         // Web Storage lives outside the realm so a navigation cannot drop it.
         rt.set_local_storage(self.context.local_storage.clone());
         rt.set_session_storage(self.session_storage.clone());
-        rt.set_indexed_db(self.context.indexed_db.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -6774,6 +6773,7 @@ mod tests {
         page.navigate(&origin_a).await.unwrap();
         let back = page.evaluate("localStorage.getItem('l1')");
         assert_eq!(back.as_str(), Some("local-value"));
+        assert_eq!(page.evaluate("sessionStorage.getItem('s1')").as_str(), Some("session-value"));
     }
 
     #[tokio::test]
@@ -6818,6 +6818,16 @@ mod tests {
             view.get("session") == Some(&serde_json::Value::Null),
             "sessionStorage must not cross tabs: {view:?}"
         );
+        assert_eq!(second.evaluate("(() => { localStorage.setItem('shared', 'from-tab-two'); sessionStorage.setItem('tab', 'from-tab-two'); return localStorage.getItem('shared'); })()"),
+            serde_json::json!("from-tab-two"));
+        second.suspend_js();
+        first.suspend_js();
+        first.resume_js();
+        assert_eq!(first.evaluate("[localStorage.getItem('shared'), sessionStorage.getItem('tab')]"),
+            serde_json::json!(["from-tab-two", "from-tab-one"]));
+        first.suspend_js();
+        second.resume_js();
+        assert_eq!(second.evaluate("sessionStorage.getItem('tab')").as_str(), Some("from-tab-two"));
     }
 
     /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the

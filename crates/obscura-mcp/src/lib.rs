@@ -2221,39 +2221,19 @@ fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
         "same_site": c.same_site,
         "expires": c.expires,
     })).collect();
-    // Web Storage now lives in the context, so every origin the browser has
-    // seen is reported, not only the page's current one. That is the whole point
-    // of an exported session state: an agent stashes it and restores it later.
+    // Pull localStorage + sessionStorage for the current page's origin.
     let storage_js = r#"(function(){
         var ls = [], ss = [];
         try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
         try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
         return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
     })()"#;
-    let mut origins: Vec<Value> = Vec::new();
-    if state.active_tab.is_some() {
-        let storage = state.page_mut().evaluate(storage_js);
-        if storage.is_object() {
-            origins.push(storage);
-        }
-    }
-    // Any origin written by a page that has since navigated away still counts.
-    for (origin, entries) in state.context.local_storage.entries() {
-        if entries.is_empty() {
-            continue;
-        }
-        if origins
-            .iter()
-            .any(|entry| entry.get("origin").and_then(Value::as_str) == Some(origin.as_str()))
-        {
-            continue;
-        }
-        origins.push(json!({
-            "origin": origin,
-            "localStorage": entries,
-            "sessionStorage": [],
-        }));
-    }
+    let storage = if state.active_tab.is_some() {
+        state.page_mut().evaluate(storage_js)
+    } else {
+        Value::Null
+    };
+    let origins = if storage.is_object() { vec![storage] } else { vec![] };
     let out = json!({ "cookies": cookies, "origins": origins });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
