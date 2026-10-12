@@ -44,8 +44,11 @@ class RepairV8CacheTests(unittest.TestCase):
                     checksum = archive.with_suffix(".sum")
                     checksum.write_text("cached URL")
                     run = subprocess.run(["bash", "-euc", script], cwd=root, env=environment, capture_output=True, text=True)
-                    self.assertEqual(run.returncode, clean_exit if should_clean else 0, run.stderr)
-                    self.assertEqual(checksum.exists(), not should_clean)
+                    blocked = kind == "directory"
+                    self.assertEqual(run.returncode, 1 if blocked else clean_exit if should_clean else 0, run.stderr)
+                    self.assertEqual(checksum.exists(), not should_clean and not blocked)
+                    if blocked:
+                        self.assertIn("directory", run.stderr.lower())
                     if should_clean:
                         self.assertEqual(calls.read_text().splitlines(), ["clean", "--release", "-p", "v8"])
                     else:
@@ -57,8 +60,8 @@ class RepairV8CacheTests(unittest.TestCase):
     def test_empty_archive_invalidates_only_v8(self):
         self.check_archive("empty", True)
 
-    def test_directory_is_not_an_archive(self):
-        self.check_archive("directory", True)
+    def test_directory_fails_without_cleaning_dependencies(self):
+        self.check_archive("directory", False)
 
     def test_valid_archive_preserves_warm_cache(self):
         self.check_archive("valid", False)
