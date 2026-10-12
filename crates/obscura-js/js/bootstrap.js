@@ -21,7 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -2024,7 +2024,13 @@ function _eventTargetDispatch(target, event) {
     const eventHandler = target === globalThis ? target['on' + event.type] : null;
     if (typeof eventHandler === 'function') {
       try {
-        if (eventHandler.call(target, event) === false) event.preventDefault();
+        const result = eventHandler.call(target, event);
+        if (event.type === 'beforeunload' && _beforeUnloadValues.has(event)) {
+          if (result != null) {
+            event.preventDefault();
+            if (event.returnValue === '') event.returnValue = result;
+          }
+        } else if (result === false) event.preventDefault();
       } catch (error) {
         console.error(error);
       }
@@ -10693,7 +10699,20 @@ globalThis.DOMException = (function () {
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+let _hasStickyActivation = false;
+globalThis.__obscura_markTrusted = function(ev) {
+  try {
+    if (ev) {
+      _trustedEvents.add(ev);
+      if ((ev.type === 'keydown' && ev.key !== 'Escape') || ev.type === 'mousedown'
+          || (ev.type === 'pointerdown' && ev.pointerType === 'mouse')
+          || (ev.type === 'pointerup' && ev.pointerType !== 'mouse') || ev.type === 'touchend') {
+        _hasStickyActivation = true;
+      }
+    }
+  } catch (_e) {}
+  return ev;
+};
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -10771,6 +10790,28 @@ globalThis.Event = class Event {
     return path;
   }
 };
+
+const _beforeUnloadValues = new WeakMap();
+globalThis.BeforeUnloadEvent = class BeforeUnloadEvent extends Event {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get returnValue() {
+    if (!_beforeUnloadValues.has(this)) throw new TypeError('Illegal invocation');
+    return _beforeUnloadValues.get(this);
+  }
+  set returnValue(value) {
+    if (!_beforeUnloadValues.has(this)) throw new TypeError('Illegal invocation');
+    _beforeUnloadValues.set(this, String(value));
+  }
+};
+globalThis.__obscura_fireBeforeUnload = function() {
+  const event = new Event('beforeunload', { cancelable: true });
+  _beforeUnloadValues.set(event, '');
+  Object.setPrototypeOf(event, BeforeUnloadEvent.prototype);
+  globalThis.__obscura_markTrusted(event);
+  const allowed = globalThis.dispatchEvent(event);
+  return _hasStickyActivation && (!allowed || event.returnValue !== '');
+};
+_markNative(BeforeUnloadEvent);
 _markNative(Event);
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }

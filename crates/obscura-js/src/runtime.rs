@@ -1253,6 +1253,10 @@ impl ObscuraJsRuntime {
         }
     }
 
+    pub fn document_url(&self) -> String {
+        self.state.borrow().url.clone()
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -2090,6 +2094,29 @@ impl ObscuraJsRuntime {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         state.render_resource_tx = tx;
         state.render_resource_rx = rx;
+    }
+
+    /// Cancel this document's current loads without letting the next render
+    /// turn rediscover and restart them. Future new URLs can still load.
+    #[cfg(feature = "render")]
+    pub fn stop_render_resource_loading(&mut self) {
+        self.service_render_resources();
+        let (pending, backlog, queued, images) = {
+            let mut state = self.state.borrow_mut();
+            (std::mem::take(&mut state.render_resource_in_flight),
+                std::mem::take(&mut state.render_resource_backlog),
+                state.render_resources.take_sync_misses(),
+                std::mem::take(&mut state.render_image_in_flight))
+        };
+        self.abandon_render_resources();
+        let mut state = self.state.borrow_mut();
+        for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
+            state.render_resources.stop_resource(&url, profile);
+        }
+        for ((_, url, profile), (cancel, _)) in images {
+            state.render_resources.stop_resource(&url, Some(profile));
+            let _ = cancel.send(());
+        }
     }
 
     /// Whether a page transport (plain or stealth client) is installed.

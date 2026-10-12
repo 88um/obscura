@@ -1058,7 +1058,9 @@ pub fn emit_navigation_events(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
-    let mut phase3 = vec![
+    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
+        Vec::new()
+    } else { vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),
             params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
@@ -1079,8 +1081,8 @@ pub fn emit_navigation_events(
             params: json!({"timestamp": ts}),
             session_id: es.clone(),
         },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+    ] };
+    if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
@@ -1269,6 +1271,30 @@ fn network_loading_failed(
             "canceled": error_text == "net::ERR_ABORTED"}),
         session_id,
     }
+}
+
+pub(crate) fn emit_aborted_navigation(
+    ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
+    loader_id: &str, url: &str, method: &str, page_id: &str,
+) {
+    let start = ctx.pending_events.len();
+    let ts = timestamp();
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
+            "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
+            "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFailed".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
+            "errorText": "net::ERR_ABORTED", "canceled": true}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(), session_id: session_id.clone(),
+        params: json!({"frameId": frame_id}),
+    });
+    fan_out_network_events(ctx, page_id, session_id, start);
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1461,23 +1487,40 @@ pub async fn handle(
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
         "close" => {
-            // go-rod closes a tab with `Page.close` and then blocks until it
-            // receives `Target.targetDestroyed` for that target (rod/page.go
-            // `Close`). Returning "Unknown Page method" left every crawled page
-            // stuck in rod's session map. Chromium supports Page.close, so
-            // share the teardown with `Target.closeTarget`.
-            let target_id = ctx
-                .get_session_page(session_id)
-                .ok_or("No page for session")?
-                .id
-                .clone();
+            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let target_id = page.id.clone();
+            if ctx.pending_beforeunload_close.contains_key(&target_id) { return Ok(json!({})); }
+            let confirmation = if page.has_js() {
+                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                    .evaluate("globalThis.__obscura_fireBeforeUnload()")
+                    .as_bool().ok_or("Could not run beforeunload handlers")?
+            } else { false };
+            if confirmation {
+                let url = ctx.get_page(&target_id).ok_or("No page")?.url_string();
+                ctx.pending_beforeunload_close.insert(target_id, session_id.clone());
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.javascriptDialogOpening".into(), session_id: session_id.clone(),
+                    params: json!({"url": url, "type": "beforeunload", "message": "",
+                        "hasBrowserHandler": true, "defaultPrompt": ""}),
+                });
+                return Ok(json!({}));
+            }
             crate::domains::target::close_target(ctx, &target_id);
             Ok(json!({}))
         }
+        "handleJavaScriptDialog" => {
+            let target_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            let accept = params.get("accept").and_then(|value| value.as_bool()).ok_or("accept required")?;
+            let owner = ctx.pending_beforeunload_close.remove(&target_id).ok_or("No dialog is showing")?;
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.javascriptDialogClosed".into(), session_id: owner,
+                params: json!({"result": accept, "userInput": ""}),
+            });
+            if accept { crate::domains::target::close_target(ctx, &target_id); }
+            Ok(json!({}))
+        }
         "stopLoading" => {
-            // Chromium answers `{}` here; go-rod calls it before each navigate.
-            // It only has to look like a success - the in-flight navigation is
-            // cancelled by the navigate that follows.
+            ctx.get_session_page_mut(session_id).ok_or("No page for session")?.stop_loading();
             Ok(json!({}))
         }
         "getFrameTree" => {

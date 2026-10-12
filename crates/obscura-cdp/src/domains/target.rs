@@ -318,11 +318,7 @@ pub async fn handle(
     }
 }
 
-/// Detach every session attached to `target_id`, announce the destruction to
-/// subscribers and drop the page. Shared by `Target.closeTarget` and
-/// `Page.close`: go-rod closes tabs with `Page.close` and then blocks until it
-/// sees `Target.targetDestroyed` (rod/page.go `Close`), so both paths must emit
-/// the same lifecycle events.
+/// Detach the target's sessions, announce destruction, and release its state.
 pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
     let mut sessions = ctx.sessions
         .iter()

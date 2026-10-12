@@ -285,12 +285,13 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
-    /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
+    /// Cancellation handle and waiters sharing an HTMLImageElement request. The key keeps
     /// navigation identity and request credentials separate so neither stale
     /// pages nor incompatible CORS profiles share a completion.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
-        HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+        HashMap<(u64, String, ImageRequestProfile),
+            (tokio::sync::oneshot::Sender<()>, Vec<tokio::sync::oneshot::Sender<()>>)>,
     /// Page-transport loads for resources that cache-only layout or paint
     /// missed. The owning page fetches them and sends the outcome here; the
     /// runtime applies results at its own event-loop turns and at every
@@ -7822,16 +7823,17 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
 
     // Different CORS/credential profiles do not share an in-flight response.
     let request_key = (document_generation, selected_url.clone(), request_profile);
-    let follower = {
+    let (follower, cancel_rx) = {
         let mut gs = shared.borrow_mut();
-        if let Some(waiters) = gs.render_image_in_flight.get_mut(&request_key) {
+        if let Some((_, waiters)) = gs.render_image_in_flight.get_mut(&request_key) {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             waiters.push(sender);
-            Some(receiver)
+            (Some(receiver), None)
         } else {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             gs.render_image_in_flight
-                .insert(request_key.clone(), Vec::new());
-            None
+                .insert(request_key.clone(), (cancel_tx, Vec::new()));
+            (None, Some(cancel_rx))
         }
     };
     if let Some(receiver) = follower {
@@ -7844,6 +7846,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             request_profile,
         );
     }
+    let cancel_rx = cancel_rx.expect("image request leader owns cancellation");
 
     struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageImageInFlightGuard {
@@ -7855,7 +7858,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let fetch = async { if blocked || parsed_url.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -7892,6 +7895,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .await
                 .ok()
         }
+    } };
+    let response = tokio::select! {
+        response = fetch => response,
+        _ = cancel_rx => None,
     };
     let bytes = response.and_then(|response| {
         (200..300)
@@ -7900,7 +7907,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     });
     let waiters = {
         let mut gs = shared.borrow_mut();
-        if gs.document_generation == document_generation {
+        if gs.document_generation == document_generation && gs.render_image_in_flight.contains_key(&request_key) {
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
@@ -7926,6 +7933,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         }
         gs.render_image_in_flight
             .remove(&request_key)
+            .map(|(_, waiters)| waiters)
             .unwrap_or_default()
     };
     for waiter in waiters {
