@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
+    ObscuraState, OriginStorage, RuntimeEvent, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -1166,6 +1166,19 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    /// Install the context-scoped `localStorage` backing store. The Arc lives on
+    /// the BrowserContext, so entries outlive the V8 realm that wrote them.
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
+    }
+
+    /// Install the page-owned `sessionStorage` backing store, so an entry
+    /// survives realm teardown on a same-origin navigation and on CDP target
+    /// switching while staying inside the tab (issue #678).
+    pub fn set_session_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().session_storage = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
@@ -22415,6 +22428,95 @@ mod tests {
                 [true, true, ""]
             ])
         );
+    }
+
+    #[test]
+    fn web_storage_preserves_undefined_values_and_rejects_symbol_arguments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
+            store.setItem('undefined', undefined);
+            const errors = [() => store.setItem(Symbol('key'), 'value'),
+                () => store.setItem('symbol', Symbol('value')),
+                () => store.getItem(Symbol('key')), () => store.removeItem(Symbol('key'))]
+                .map(call => { try { call(); return null; } catch (error) { return error.name; } });
+            return [store.getItem('undefined'), ...errors];
+        })"#).unwrap(), serde_json::json!([
+            ["undefined", "TypeError", "TypeError", "TypeError", "TypeError"],
+            ["undefined", "TypeError", "TypeError", "TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
+    fn web_storage_preserves_unpaired_utf16_and_transport_prefixes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
+            store.setItem('\ud800', '\udfff');
+            store.setItem('\0"ordinary"', '\0"literal"');
+            return [store.key(0).charCodeAt(0), store.getItem('\ud800').charCodeAt(0),
+                Object.keys(store).map(key => key.charCodeAt(0)), store.getItem('\0"ordinary"')];
+        })"#).unwrap(), serde_json::json!([
+            [55296, 57343, [55296, 0], "\0\"literal\""],
+            [55296, 57343, [55296, 0], "\0\"literal\""]
+        ]));
+    }
+
+    #[test]
+    fn web_storage_initial_frame_inherits_the_parent_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            localStorage.setItem('local', 'shared');
+            sessionStorage.setItem('session', 'same-tab');
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            return [frame.contentWindow.localStorage.getItem('local'),
+                frame.contentWindow.sessionStorage.getItem('session')];
+        })()"#).unwrap(), serde_json::json!(["shared", "same-tab"]));
+    }
+
+    #[test]
+    fn web_storage_file_documents_share_the_file_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("file:///tmp/first.html");
+        rt.evaluate("localStorage.setItem('token', 'file-value')").unwrap();
+        rt.set_url("file:///tmp/second.html");
+        assert_eq!(rt.evaluate("localStorage.getItem('token')").unwrap(), serde_json::json!("file-value"));
+    }
+
+    #[test]
+    fn web_storage_access_tracks_url_and_inherited_origin_changes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let read = "[localStorage.getItem('token'), sessionStorage.getItem('token')]";
+        let denied = r#"['localStorage', 'sessionStorage'].map(name => {
+            try { globalThis[name]; return 'allowed'; }
+            catch (error) { return error.name; }
+        })"#;
+        rt.set_url("https://a.test/page");
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'a'))").unwrap();
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("https://b.test/page");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!([null, null]));
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'b'))").unwrap();
+        rt.set_url("https://a.test/other#fragment");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+        rt.set_url("about:blank");
+        rt.state.borrow_mut().inherited_origin = Some("https://a.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.state.borrow_mut().inherited_origin = Some("https://b.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["b", "b"]));
+        rt.state.borrow_mut().inherited_origin = None;
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+    }
+
+    #[test]
+    fn web_storage_getters_reject_opaque_origins() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(r#"['localStorage', 'sessionStorage'].map(name => {
+            try { return globalThis[name].getItem('token'); }
+            catch (error) { return error.name; }
+        })"#).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
     }
 
     #[test]

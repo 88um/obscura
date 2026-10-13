@@ -415,6 +415,7 @@ async fn run_cli() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
 
@@ -600,6 +601,14 @@ async fn run_cli() -> anyhow::Result<()> {
         }) => {
             configure_font_directories(&font_dirs)?;
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
+            // `obscura mcp` builds its BrowserContext from the environment, so
+            // the global profile flag has to be handed over explicitly.
+            if let Some(ref dir) = global_storage_dir {
+                // SAFETY: single threaded here, before the MCP server starts.
+                unsafe {
+                    std::env::set_var("OBSCURA_STORAGE_DIR", dir);
+                }
+            }
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
             } else {
@@ -1166,7 +1175,7 @@ async fn run_fetch(
                     other => other.to_string(),
                 };
                 write_or_print(rendered, output.as_ref()).await?;
-                context.save_cookies();
+                context.save_storage();
                 return Ok(());
             }
             if screenshot.is_some() {
@@ -1340,7 +1349,7 @@ async fn run_fetch(
                     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
                 );
             }
-            context.save_cookies();
+            context.save_storage();
             return Ok(());
         }
         #[cfg(not(feature = "render"))]
@@ -1365,7 +1374,7 @@ async fn run_fetch(
     write_or_print(rendered, output.as_ref()).await?;
 
     // Save cookies to disk if storage_dir is configured
-    context.save_cookies();
+    context.save_storage();
 
     Ok(())
 }

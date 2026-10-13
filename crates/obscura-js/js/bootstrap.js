@@ -12224,35 +12224,107 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
 // (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
 // the named getter/setter so length/key()/iteration stay in sync with the
-// backing map. Plain prototype methods alone could not intercept direct
+// backing store. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
+// The store itself is Rust, keyed by origin, so it outlives the realm.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+// The backing store is Rust, keyed by origin, because the realm is rebuilt on
+// every navigation and a realm-local object loses every entry with it
+// (issue #678). The slot records which op owns the store so a same-origin frame
+// realm and the top document share the data while a cross-origin frame lands in
+// its own origin's bucket.
+const _storageSlots = new WeakMap();
+const _storageSlot = (value) => {
+  const slot = _storageSlots.get(value);
+  if (!slot) throw new TypeError('Illegal invocation');
+  return slot;
+};
+const _storageOp = (slot) => slot.local ? __obscuraCore.ops.op_local_storage : __obscuraCore.ops.op_session_storage;
+// Preserve WTF-16 through UTF-8 ops and profile JSON without changing normal strings.
+const _storageEncode = (value) => value.startsWith('\0') || !value.isWellFormed()
+  ? '\0' + JSON.stringify(value) : value;
+const _storageDecode = (value) => {
+  if (typeof value === 'string' && value.startsWith('\0')) {
+    try {
+      const decoded = JSON.parse(value.slice(1));
+      if (typeof decoded === 'string' && (decoded.startsWith('\0') || !decoded.isWellFormed())) return decoded;
+    } catch (_) {}
+  }
+  return value;
+};
+const _storageCall = (slot, command, key, value) => {
+  // The WebIDL string conversions stay outside the try: a Symbol argument has
+  // to raise TypeError, not fall through to the null that means "no backend".
+  const k = command === 'key' ? `${key}` : _storageEncode(`${key}`);
+  const v = command === 'set' ? _storageEncode(`${value}`) : '';
+  let result;
+  try { result = JSON.parse(_storageOp(slot)(command, k, v)); }
+  catch (_) { return null; }
+  if (result && result.error === 'SecurityError')
+    throw new DOMException('Storage is unavailable for an opaque origin.', 'SecurityError');
+  if (command === 'get' || command === 'key') return _storageDecode(result);
+  if (command === 'snapshot' && Array.isArray(result))
+    return result.map(([key, value]) => [_storageDecode(key), _storageDecode(value)]);
+  return result;
+};
+// [key, value] pairs in insertion order, which is the order Storage.key() is
+// defined over.
+const _storageEntries = (slot) => {
+  const entries = _storageCall(slot, 'snapshot', '');
+  return Array.isArray(entries) ? entries : [];
+};
+Storage.prototype.getItem = function(k) {
+  const value = _storageCall(_storageSlot(this), 'get', k, '');
+  return typeof value === 'string' ? value : null;
+};
+Storage.prototype.setItem = function(k, v) {
+  const stored = _storageCall(_storageSlot(this), 'set', k, v);
+  if (stored !== true) throw new DOMException('Setting the value exceeded the quota.', 'QuotaExceededError');
+};
+Storage.prototype.removeItem = function(k) { _storageCall(_storageSlot(this), 'remove', k, ''); };
+Storage.prototype.clear = function() { _storageCall(_storageSlot(this), 'clear', '', ''); };
+Storage.prototype.key = function(i) {
+  i = i >>> 0;
+  return _storageCall(_storageSlot(this), 'key', i, '');
+};
+Object.defineProperty(Storage.prototype, 'length', {
+  get: function() { return _storageCall(_storageSlot(this), 'length', '', ''); },
+  configurable: true,
+});
 
-const _mkStore = () => {
+const _mkStore = (local) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
-  return new Proxy(target, {
+  const slot = { local: !!local };
+  const isReal = (p) => p === 'constructor' || (p in Storage.prototype);
+  const proxy = new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return t.getItem(p) !== null; },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys() { return _storageEntries(slot).map((entry) => entry[0]); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      if (typeof p !== 'symbol') {
+        const value = t.getItem(p);
+        if (value !== null)
+          return { value, writable: true, enumerable: true, configurable: true };
+      }
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
+  // Both the target and the proxy resolve to the slot: property access can
+  // arrive on either depending on how the receiver is threaded.
+  _storageSlots.set(target, slot);
+  _storageSlots.set(proxy, slot);
+  return proxy;
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+for (const [name, local] of [['localStorage', true], ['sessionStorage', false]]) {
+  const store = _mkStore(local);
+  Object.defineProperty(globalThis, name, {configurable: true, enumerable: true, get() {
+    if (!__obscuraCore.ops.op_storage_access())
+      throw new DOMException('Storage is unavailable for an opaque origin.', 'SecurityError');
+    return store;
+  }});
+}
 
 globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
