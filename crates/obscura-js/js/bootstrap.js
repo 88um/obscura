@@ -12320,7 +12320,8 @@ const _mkStore = (local) => {
 for (const [name, local] of [['localStorage', true], ['sessionStorage', false]]) {
   const store = _mkStore(local);
   Object.defineProperty(globalThis, name, {configurable: true, enumerable: true, get() {
-    _storageCall(_storageSlot(store), 'access', '', '');
+    if (!__obscuraCore.ops.op_storage_access())
+      throw new DOMException('Storage is unavailable for an opaque origin.', 'SecurityError');
     return store;
   }});
 }

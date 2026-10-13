@@ -165,8 +165,15 @@ const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
 const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
 
 #[derive(Default)]
+struct OriginStorageEntries {
+    items: Vec<(String, String)>,
+    indices: HashMap<String, usize>,
+    bytes: usize,
+}
+
+#[derive(Default)]
 struct OriginStorageInner {
-    origins: HashMap<String, Vec<(String, String)>>,
+    origins: HashMap<String, OriginStorageEntries>,
     bytes: usize,
     changed: HashSet<String>,
 }
@@ -182,21 +189,21 @@ impl OriginStorage {
     }
 
     pub fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
-        self.lock().origins.get(origin).cloned().unwrap_or_default()
+        self.lock().origins.get(origin).map(|entries| entries.items.clone()).unwrap_or_default()
     }
 
     pub fn get(&self, origin: &str, key: &str) -> Option<String> {
         self.lock().origins.get(origin)
-            .and_then(|items| items.iter().find(|(name, _)| name == key))
+            .and_then(|entries| entries.indices.get(key).and_then(|index| entries.items.get(*index)))
             .map(|(_, value)| value.clone())
     }
 
     pub fn len(&self, origin: &str) -> usize {
-        self.lock().origins.get(origin).map_or(0, Vec::len)
+        self.lock().origins.get(origin).map_or(0, |entries| entries.items.len())
     }
 
     pub fn key(&self, origin: &str, index: usize) -> Option<String> {
-        self.lock().origins.get(origin).and_then(|items| items.get(index))
+        self.lock().origins.get(origin).and_then(|entries| entries.items.get(index))
             .map(|(key, _)| key.clone())
     }
 
@@ -205,23 +212,26 @@ impl OriginStorage {
         let mut inner = self.lock();
         if !inner.origins.contains_key(origin)
             && inner.origins.len() >= LOCAL_STORAGE_ORIGIN_COUNT_LIMIT { return false; }
-        let items = inner.origins.get(origin);
-        let previous = items.and_then(|items| items.iter().find(|(name, _)| name == &key));
+        let entries = inner.origins.get(origin);
+        let index = entries.and_then(|entries| entries.indices.get(&key).copied());
+        let previous = entries.and_then(|entries| index.and_then(|index| entries.items.get(index)));
         if previous.is_some_and(|(_, previous)| previous == &value) { return true; }
         let previous_bytes = previous.map_or(0, |(name, value)| name.len() + value.len());
-        let origin_bytes = items.map_or(0, |items| {
-            items.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>()
-        });
+        let origin_bytes = entries.map_or(0, |entries| entries.bytes);
         let new_bytes = key.len() + value.len();
         let next_origin_bytes = origin_bytes.saturating_sub(previous_bytes) + new_bytes;
         let next_total_bytes = inner.bytes.saturating_sub(previous_bytes) + new_bytes;
         if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT {
             return false;
         }
-        let items = inner.origins.entry(origin.to_string()).or_default();
-        if let Some((_, old_value)) = items.iter_mut().find(|(name, _)| name == &key) {
-            *old_value = value;
-        } else { items.push((key, value)); }
+        let entries = inner.origins.entry(origin.to_string()).or_default();
+        if let Some(index) = index {
+            entries.items[index].1 = value;
+        } else {
+            entries.indices.insert(key.clone(), entries.items.len());
+            entries.items.push((key, value));
+        }
+        entries.bytes = next_origin_bytes;
         inner.bytes = next_total_bytes;
         inner.changed.insert(origin.to_string());
         true
@@ -229,12 +239,19 @@ impl OriginStorage {
 
     pub fn remove(&self, origin: &str, key: &str) {
         let mut inner = self.lock();
-        let removed = inner.origins.get_mut(origin).and_then(|items| {
-            items.iter().position(|(name, _)| name == key).map(|index| items.remove(index))
+        let removed = inner.origins.get_mut(origin).and_then(|entries| {
+            entries.indices.remove(key).map(|index| {
+                let removed = entries.items.remove(index);
+                entries.bytes -= removed.0.len() + removed.1.len();
+                for (index, (name, _)) in entries.items.iter().enumerate().skip(index) {
+                    if let Some(position) = entries.indices.get_mut(name) { *position = index; }
+                }
+                removed
+            })
         });
         if let Some((name, value)) = removed {
             inner.bytes -= name.len() + value.len();
-            if inner.origins.get(origin).is_some_and(Vec::is_empty) { inner.origins.remove(origin); }
+            if inner.origins.get(origin).is_some_and(|entries| entries.items.is_empty()) { inner.origins.remove(origin); }
             inner.changed.insert(origin.to_string());
         }
     }
@@ -242,30 +259,28 @@ impl OriginStorage {
     pub fn entries(&self) -> Vec<(String, Vec<(String, String)>)> {
         let inner = self.lock();
         let mut out: Vec<_> = inner.origins.iter()
-            .map(|(origin, items)| (origin.clone(), items.clone())).collect();
+            .map(|(origin, entries)| (origin.clone(), entries.items.clone())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
     /// Restore a validated profile without scheduling a disk rewrite.
     pub fn load(&self, origin: &str, items: Vec<(String, String)>) -> bool {
-        let mut seen = HashSet::new();
+        let mut indices = HashMap::new();
         let mut bytes = 0usize;
-        for (name, value) in &items {
-            if !seen.insert(name.as_str()) { return false; }
+        for (index, (name, value)) in items.iter().enumerate() {
             bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
             if bytes > LOCAL_STORAGE_ORIGIN_LIMIT { return false; }
+            if indices.insert(name.clone(), index).is_some() { return false; }
         }
         let mut inner = self.lock();
         if !items.is_empty() && !inner.origins.contains_key(origin)
             && inner.origins.len() >= LOCAL_STORAGE_ORIGIN_COUNT_LIMIT { return false; }
-        let previous_bytes = inner.origins.get(origin).map_or(0, |old| {
-            old.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>()
-        });
+        let previous_bytes = inner.origins.get(origin).map_or(0, |old| old.bytes);
         let next_bytes = inner.bytes.saturating_sub(previous_bytes).saturating_add(bytes);
         if next_bytes > LOCAL_STORAGE_TOTAL_LIMIT { return false; }
         if items.is_empty() { inner.origins.remove(origin); }
-        else { inner.origins.insert(origin.to_string(), items); }
+        else { inner.origins.insert(origin.to_string(), OriginStorageEntries { items, indices, bytes }); }
         inner.bytes = next_bytes;
         inner.changed.remove(origin);
         true
@@ -283,7 +298,7 @@ impl OriginStorage {
         let mut origins: Vec<_> = inner.changed.iter().cloned().collect();
         origins.sort();
         for origin in origins {
-            if write(&origin, inner.origins.get(&origin).map_or(&[], Vec::as_slice)) {
+            if write(&origin, inner.origins.get(&origin).map_or(&[], |entries| entries.items.as_slice())) {
                 inner.changed.remove(&origin);
             }
         }
@@ -293,13 +308,19 @@ impl OriginStorage {
 
     pub fn clear(&self, origin: &str) {
         let mut inner = self.lock();
-        if let Some(items) = inner.origins.remove(origin) {
-            inner.bytes -= items.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>();
+        if let Some(entries) = inner.origins.remove(origin) {
+            inner.bytes -= entries.bytes;
             inner.changed.insert(origin.to_string());
         }
     }
 }
 
+#[derive(Default)]
+struct StorageOriginCache {
+    url: String,
+    inherited_origin: Option<String>,
+    origin: String,
+}
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
@@ -307,6 +328,7 @@ pub struct ObscuraState {
     /// Initial about:blank documents retain their creator's base URL and origin.
     pub(crate) about_base_url: Option<String>,
     pub(crate) inherited_origin: Option<String>,
+    storage_origin_cache: RefCell<StorageOriginCache>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -594,6 +616,7 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
+            storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
             encoding: "UTF-8".to_string(),
             content_type: String::new(),
             title: String::new(),
@@ -4735,6 +4758,35 @@ mod tests {
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
     #[test]
+    fn origin_storage_deletion_reinsertion_and_profile_replacement_keep_keys_and_quota_consistent() {
+        let store = OriginStorage::default();
+        let origin = "https://app.test";
+        assert!(store.load(origin, vec![("a".into(), "one".into()), ("b".into(), "two".into()), ("c".into(), "three".into())]));
+        store.remove(origin, "b");
+        assert_eq!(store.get(origin, "c").as_deref(), Some("three"));
+        assert!(store.set(origin, "c".into(), "replaced".into()));
+        assert!(store.set(origin, "b".into(), "last".into()));
+        assert_eq!(store.snapshot(origin), vec![("a".into(), "one".into()), ("c".into(), "replaced".into()), ("b".into(), "last".into())]);
+        store.remove(origin, "a");
+        assert_eq!(store.key(origin, 0).as_deref(), Some("c"));
+        assert_eq!(store.get(origin, "b").as_deref(), Some("last"));
+
+        assert!(store.load(origin, vec![("z".into(), "x".repeat(LOCAL_STORAGE_ORIGIN_LIMIT - 1))]));
+        assert_eq!(store.get(origin, "c"), None);
+        assert!(!store.set(origin, "extra".into(), "".into()));
+        assert!(store.set(origin, "z".into(), "short".into()));
+        assert!(store.set(origin, "extra".into(), "y".repeat(LOCAL_STORAGE_ORIGIN_LIMIT - 11)));
+        assert!(!store.set(origin, "third".into(), "".into()));
+        store.remove(origin, "z");
+        assert!(store.set(origin, "third".into(), "".into()));
+        assert_eq!(store.key(origin, 0).as_deref(), Some("extra"));
+        store.clear(origin);
+        assert_eq!(store.len(origin), 0);
+        assert!(store.set(origin, "fresh".into(), "".into()));
+        assert_eq!(store.key(origin, 0).as_deref(), Some("fresh"));
+    }
+
+    #[test]
     fn origin_storage_rejects_duplicate_profile_keys_without_replacing_valid_data() {
         let store = OriginStorage::default();
         assert!(store.set("https://app.test", "token".into(), "original".into()));
@@ -6064,13 +6116,32 @@ fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Origin of the calling realm's document. A cross-origin frame must land in
 /// its own origin's bucket rather than the top document's, so this resolves the
 /// realm that made the call instead of reading page state directly.
-fn storage_origin(state: &ObscuraState) -> String {
-    state.inherited_origin.clone().unwrap_or_else(|| {
+fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
+    let cache = state.storage_origin_cache.borrow();
+    // Document identity can change without rebuilding the realm.
+    if cache.url == state.url && cache.inherited_origin == state.inherited_origin {
+        return std::cell::Ref::map(cache, |cache| cache.origin.as_str());
+    }
+    drop(cache);
+    let mut cache = state.storage_origin_cache.borrow_mut();
+    cache.url.clone_from(&state.url);
+    cache.inherited_origin.clone_from(&state.inherited_origin);
+    cache.origin = state.inherited_origin.clone().unwrap_or_else(|| {
         url::Url::parse(&state.url)
             .map(|url| if url.scheme() == "file" { "file://".to_string() }
                 else { url.origin().ascii_serialization() })
             .unwrap_or_else(|_| "null".to_string())
-    })
+    });
+    drop(cache);
+    std::cell::Ref::map(state.storage_origin_cache.borrow(), |cache| cache.origin.as_str())
+}
+
+#[op2(fast)]
+fn op_storage_access(scope: &mut v8::PinScope, state: &OpState) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let origin = storage_origin(&gs);
+    &*origin != "null"
 }
 
 fn origin_storage_command(
@@ -6121,9 +6192,10 @@ fn op_local_storage(
 ) -> String {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
+    let origin = storage_origin(&gs);
     origin_storage_command(
         &gs.local_storage,
-        &storage_origin(&gs),
+        &origin,
         command,
         key,
         value,
@@ -6142,9 +6214,10 @@ fn op_session_storage(
 ) -> String {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
+    let origin = storage_origin(&gs);
     origin_storage_command(
         &gs.session_storage,
-        &storage_origin(&gs),
+        &origin,
         command,
         key,
         value,
@@ -7395,6 +7468,7 @@ pub fn build_extension() -> Extension {
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
+        op_storage_access(),
         op_local_storage(),
         op_session_storage(),
         op_navigate(),

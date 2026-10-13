@@ -22483,6 +22483,33 @@ mod tests {
     }
 
     #[test]
+    fn web_storage_access_tracks_url_and_inherited_origin_changes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let read = "[localStorage.getItem('token'), sessionStorage.getItem('token')]";
+        let denied = r#"['localStorage', 'sessionStorage'].map(name => {
+            try { globalThis[name]; return 'allowed'; }
+            catch (error) { return error.name; }
+        })"#;
+        rt.set_url("https://a.test/page");
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'a'))").unwrap();
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("https://b.test/page");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!([null, null]));
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'b'))").unwrap();
+        rt.set_url("https://a.test/other#fragment");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+        rt.set_url("about:blank");
+        rt.state.borrow_mut().inherited_origin = Some("https://a.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.state.borrow_mut().inherited_origin = Some("https://b.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["b", "b"]));
+        rt.state.borrow_mut().inherited_origin = None;
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+    }
+
+    #[test]
     fn web_storage_getters_reject_opaque_origins() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.set_url("data:text/html,opaque");

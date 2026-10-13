@@ -61,7 +61,8 @@ survive navigation and CDP target switching within the process
 
 Web Storage is limited to 5 MiB per origin, 32 MiB per backing store and 256
 origins. Failed profile writes and removals stay pending for a later flush.
-The budgets count UTF-8 backing bytes. Strings containing unpaired UTF-16 units
+The budgets count UTF-8 key/value bytes, excluding container overhead. Strings
+containing unpaired UTF-16 units
 or starting with NUL use a NUL-prefixed JSON string escape internally, including
 in profile files; the JavaScript API decodes them losslessly. Normal strings are
 stored unchanged. Encoded strings consume more of the byte budget.
