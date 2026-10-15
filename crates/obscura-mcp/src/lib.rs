@@ -78,6 +78,7 @@ pub struct BrowserState {
     /// table is wiped on every navigation / tab switch and refilled on
     /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
+    ref_generation: u64,
 }
 
 impl BrowserState {
@@ -103,6 +104,7 @@ impl BrowserState {
             operator_network_hints: false,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
+            ref_generation: 0,
         }
     }
 
@@ -229,12 +231,20 @@ impl BrowserState {
     /// the page isn't re-rendered without it. Returns `Err` if the ref
     /// hasn't been registered (caller must call browser_snapshot first).
     fn ref_to_selector(&self, r: &str) -> Result<String, String> {
-        if !self.interactive_refs.contains_key(r) {
-            return Err(format!(
+        let node_id = *self.interactive_refs.get(r).ok_or_else(|| format!(
                 "unknown ref '{r}'; call browser_snapshot first to refresh the ref table"
-            ));
+            ))?;
+        let selector = format!("[data-obscura-ref=\"{r}\"]");
+        let same_node = self.active_tab.as_ref()
+            .and_then(|id| self.tabs.get(id))
+            .and_then(|page| page.with_dom(|dom| {
+                dom.query_selector(&selector).ok().flatten() == Some(node_id)
+            }))
+            .unwrap_or(false);
+        if !same_node {
+            return Err(format!("stale ref '{r}'; call browser_snapshot to refresh the ref table"));
         }
-        Ok(format!("[data-obscura-ref=\"{r}\"]"))
+        Ok(selector)
     }
 }
 
@@ -1498,20 +1508,23 @@ fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<S
 /// agent always sees fresh refs.
 fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
     state.interactive_refs.clear();
+    state.ref_generation = state.ref_generation.checked_add(1)
+        .ok_or("Element reference generation exhausted")?;
+    let prefix = format!("e{}-", state.ref_generation);
     let page = state.page_mut();
-    // Tag every interactable with data-obscura-ref="eN" in DOM order.
-    let tag_js = r#"(function(){
+    // Never reuse tokens: an old snapshot must not name a different action.
+    let tag_js = format!(r#"(function(){{
         var sel = 'a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=checkbox], [role=tab], [role=menuitem], [role=option], [onclick], [tabindex]:not([tabindex="-1"])';
         var els = document.querySelectorAll(sel);
         var refs = [];
-        for (var i = 0; i < els.length; i++) {
-            var ref = 'e' + (i + 1);
+        for (var i = 0; i < els.length; i++) {{
+            var ref = '{prefix}' + (i + 1);
             els[i].setAttribute('data-obscura-ref', ref);
             refs.push(ref);
-        }
+        }}
         return refs;
-    })()"#;
-    let val = page.evaluate(tag_js);
+    }})()"#);
+    let val = page.evaluate(&tag_js);
     let refs: Vec<String> = val.as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
@@ -2307,6 +2320,63 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_reject_copied_attributes_before_clicking() {
+        for mutation in [
+            "button.replaceWith(copy)",
+            "button.before(copy)",
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
+                .await.expect("test page");
+            tool_snapshot(&json!({}), &mut state).expect("snapshot");
+            let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+            tool_evaluate(&json!({"expression": format!(
+                "(function(){{ window.clicks=0; document.body.addEventListener('click',function(){{window.clicks++}}); var button=document.getElementById('target'); var copy=button.cloneNode(true); {mutation}; return true; }})()"
+            )}), &mut state).await.expect("framework rerender");
+
+            let result = tool_click(&json!({"ref": reference}), &mut state).await;
+            let clicks = state.page_mut().evaluate("window.clicks");
+            assert_eq!(clicks.as_f64(), Some(0.0), "stale ref must not click a clone: {mutation}, {result:?}");
+            assert!(result.is_err(), "stale ref must request a fresh snapshot");
+
+            tool_snapshot(&json!({}), &mut state).expect("fresh snapshot");
+            let reference = state.interactive_refs.keys().next().expect("fresh ref").clone();
+            tool_click(&json!({"ref": reference}), &mut state).await.expect("fresh ref works");
+            assert_eq!(state.page_mut().evaluate("window.clicks").as_f64(), Some(1.0));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_from_old_snapshots_cannot_alias_new_targets() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
+            .await.expect("test page");
+        tool_snapshot(&json!({}), &mut state).expect("snapshot");
+        let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+        tool_evaluate(&json!({"expression":
+            "(function(){window.clicks=0; document.body.addEventListener('click',function(){window.clicks++}); var other=document.createElement('button'); other.textContent='Delete'; document.body.prepend(other); return true;})()"
+        }), &mut state).await.expect("insert another action");
+        tool_snapshot(&json!({}), &mut state).expect("new snapshot");
+        let result = tool_click(&json!({"ref": reference}), &mut state).await;
+        assert_eq!(state.page_mut().evaluate("window.clicks").as_f64(), Some(0.0), "old ref must not act on a new target: {result:?}");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_follow_the_same_connected_node_after_reordering() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<button id=target>Buy</button><p>Details</p>")
+            .await.expect("test page");
+        tool_snapshot(&json!({}), &mut state).expect("snapshot");
+        let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+        tool_evaluate(&json!({"expression":
+            "(function(){window.clicked=''; var button=document.getElementById('target'); button.addEventListener('click',function(){window.clicked=this.id}); document.body.appendChild(button); return true;})()"
+        }), &mut state).await.expect("reorder same node");
+        tool_click(&json!({"ref": reference}), &mut state).await.expect("same node ref");
+        assert_eq!(state.page_mut().evaluate("window.clicked"), json!("target"));
+    }
 
     // The promise wrapper has to work on a page that has never been evaluated
     // on: the slot is created lazily, so the first synchronous expression must
