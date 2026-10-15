@@ -1330,6 +1330,7 @@ impl Page {
 
         let Some(PendingFrameWork::Attached {
             frame_id,
+            parent_frame_id,
             frame_url,
             sources,
             ..
@@ -1338,6 +1339,7 @@ impl Page {
             return false;
         };
         let frame_id = *frame_id;
+        let parent_frame_id = *parent_frame_id;
         let frame_url = frame_url.clone();
         let sources = std::mem::take(sources);
         let Some(index) = self
@@ -1359,6 +1361,11 @@ impl Page {
             }
         }
         self.pending_frame_work.pop_front();
+        self.execute_frame_owner_script(parent_frame_id, &format!(
+            "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+             if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+               frame.dispatchEvent(new Event('load')); }})()"
+        ));
         true
     }
 
@@ -1447,13 +1454,13 @@ impl Page {
         }
     }
 
-    /// Executes cleanup in the realm that owns the iframe element. Nested
+    /// Executes code in the realm that owns the iframe element. Nested
     /// iframe registries live in their parent frame, not in the page realm.
     fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
         if parent_frame_id == 0 {
             if let Some(js) = self.js.as_mut() {
-                if let Err(error) = js.execute_script("<frame-detach>", script) {
-                    tracing::debug!("releasing frame references failed: {error}");
+                if let Err(error) = js.execute_script("<frame-owner>", script) {
+                    tracing::debug!("frame owner script failed: {error}");
                 }
             }
             return;
@@ -1468,7 +1475,7 @@ impl Page {
         };
         let Some(js) = self.js.as_mut() else { return };
         if let Err(error) = self.frames[index].execute_script(js, script) {
-            tracing::debug!("releasing nested frame references failed: {error}");
+            tracing::debug!("nested frame owner script failed: {error}");
         }
     }
 
@@ -4385,9 +4392,10 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
+        if self.js.is_some() {
+            match self
+                .evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS)
                 .await
             {
                 Ok(info) => info,
@@ -4433,13 +4441,8 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
+            let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+            self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
@@ -4468,14 +4471,15 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
+        if self.js.is_some() {
+            match self
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     args,
                     return_by_value,
                     await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS,
                 )
                 .await
             {
@@ -4518,15 +4522,45 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
+        let evaluation = js.start_cdp_call(
             function_declaration,
             object_id,
             args,
             return_by_value,
             await_promise,
-            await_timeout_ms,
-        )
-        .await
+        )?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.callFunctionOn").await
+    }
+
+    async fn await_cdp_evaluation(
+        &mut self,
+        evaluation: obscura_js::runtime::CdpEvaluation,
+        return_by_value: bool,
+        timeout_ms: u64,
+        method: &str,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let pending = match evaluation {
+            obscura_js::runtime::CdpEvaluation::Complete(info) => return Ok(info),
+            obscura_js::runtime::CdpEvaluation::Pending(pending) => pending,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let wait = async {
+            loop {
+                let queued = !self.pending_frame_work.is_empty();
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+                let mut ready = false;
+                let progressed = js.resolve_promises_until(|js| {
+                    ready = js.cdp_evaluation_ready(&pending);
+                    ready || queued || js.has_pending_frame_tasks()
+                }, duration_millis_u64(remaining)).await;
+                if ready { return js.finish_cdp_evaluation(pending, return_by_value); }
+                if !progressed { return Err(format!("{method} promise did not settle within {timeout_ms}ms")); }
+                self.advance_frames().await;
+            }
+        };
+        tokio::time::timeout_at(deadline, wait).await
+            .unwrap_or_else(|_| Err(format!("{method} promise did not settle within {timeout_ms}ms")))
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -7054,6 +7088,41 @@ mod tests {
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_load_waits_for_the_real_document_and_author_scripts() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page("frame-load-ready", &base, "<html><body></body></html>");
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        page.js.as_mut().unwrap().evaluate(
+            "(function(){ globalThis.loads = []; const frame = document.createElement('iframe'); \
+             frame.onload = function(){ loads.push([typeof frame.contentDocument.appendChild, \
+               frame.contentWindow.__childReady === true, frame.contentDocument.readyState]); }; \
+             frame.src = '/child.html'; document.body.appendChild(frame); return 1; })()"
+        ).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2), page.js.as_mut().unwrap().run_event_loop(),
+        ).await.unwrap().unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(), serde_json::json!([]),
+            "the iframe fired load before its scripts could run");
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.advance_frames())
+            .await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(),
+            serde_json::json!([["function", true, "complete"]]));
+        page.advance_frames().await;
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads.length === 1").unwrap(), serde_json::json!(true));
+
+        let script = "new Promise(resolve => { const frame = document.createElement('iframe'); \
+            frame.onload = () => resolve([typeof frame.contentDocument.appendChild, \
+                frame.contentWindow.__childReady === true]); \
+            frame.src = '/child.html'; document.body.appendChild(frame); })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!(["function", true]));
+        let called = page.call_function_on_for_cdp_with_timeout(
+            &format!("() => {script}"), None, &[], true, true, 2_000,
+        ).await.unwrap();
+        assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
     }
 
     #[tokio::test(flavor = "current_thread")]

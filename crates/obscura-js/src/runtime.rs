@@ -130,7 +130,8 @@ fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
     Some(FALLBACK.enter())
 }
 
-const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
+#[doc(hidden)]
+pub const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(feature = "render")]
 const MAX_PENDING_RENDER_RESOURCES: usize = 128;
@@ -228,6 +229,20 @@ pub struct RemoteObjectInfo {
     pub object_id: Option<String>,
     pub value: Option<serde_json::Value>,
     pub unserializable_value: Option<String>,
+}
+
+/// A started CDP command, so the browser can service frame work while awaiting it.
+#[doc(hidden)]
+pub enum CdpEvaluation {
+    Complete(RemoteObjectInfo),
+    Pending(PendingCdpEvaluation),
+}
+
+#[doc(hidden)]
+pub struct PendingCdpEvaluation {
+    object_id: String,
+    done_counter: u64,
+    recipe: Option<String>,
 }
 
 /// CDP remote objects that can be rebuilt when a page's V8 runtime is
@@ -1120,6 +1135,12 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.pending_frame_bytes = 0;
         std::mem::take(&mut state.pending_frames)
+    }
+
+    #[doc(hidden)]
+    pub fn has_pending_frame_tasks(&self) -> bool {
+        let state = self.state.borrow();
+        !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.
@@ -2572,6 +2593,17 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        let evaluation = self.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_evaluation(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
         // Every shape of this command now travels the same path. The
         // by-value sync case used to short-circuit through `evaluate`,
         // whose wrapper answers an exception with `null` — indistinguishable
@@ -2655,44 +2687,13 @@ impl ObscuraJsRuntime {
             .execute_runtime_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
-        let meta_str = if await_promise {
-            let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
-            let settled = self
-                .resolve_promises_until(
-                    |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
-                    },
-                    await_timeout_ms,
-                )
-                .await;
-            if !settled {
-                return Err(format!(
-                    "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
-                ));
-            }
-            let __dt = __t0.elapsed();
-            if __dt > std::time::Duration::from_secs(1) {
-                let preview: String = expression
-                    .chars()
-                    .take(200)
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .collect();
-                tracing::debug!(
-                    "Runtime.evaluate awaitPromise took {}ms; expr={}",
-                    __dt.as_millis(),
-                    preview,
-                );
-            }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?
-        } else {
-            result
-        };
+        if await_promise {
+            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
+                object_id: oid, done_counter,
+                recipe: if return_by_value { None } else { Some(expression.to_string()) },
+            }));
+        }
+        let meta_str = result;
 
         // Neither a rejection nor a synchronous throw is a protocol failure.
         // CDP answers the command and puts the value in `exceptionDetails`,
@@ -2708,10 +2709,10 @@ impl ObscuraJsRuntime {
             )
             .map_err(|e| format!("JS error: {}", e))?;
         if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid);
+            return self.thrown_info(&oid).map(CdpEvaluation::Complete);
         }
         if return_by_value {
-            return self.take_cdp_result_by_value(&oid);
+            return self.take_cdp_result_by_value(&oid).map(CdpEvaluation::Complete);
         }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -2724,7 +2725,7 @@ impl ObscuraJsRuntime {
         if info.object_id.is_some() {
             self.evaluation_recipes.insert(oid, expression.to_string());
         }
-        Ok(info)
+        Ok(CdpEvaluation::Complete(info))
     }
 
     pub async fn call_function_on_for_cdp(
@@ -2755,6 +2756,19 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        let evaluation = self.start_cdp_call(function_declaration, object_id, arguments, return_by_value, await_promise)?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.callFunctionOn").await
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_call(
+        &mut self,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
         self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
@@ -2798,69 +2812,9 @@ impl ObscuraJsRuntime {
             self.execute_runtime_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
-            let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
-            let settled = self
-                .resolve_promises_until(
-                    |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
-                    },
-                    await_timeout_ms,
-                )
-                .await;
-            if !settled {
-                return Err(format!(
-                    "Runtime.callFunctionOn promise did not settle within {await_timeout_ms}ms"
-                ));
-            }
-            let __dt = __t0.elapsed();
-            if __dt > std::time::Duration::from_secs(1) {
-                let preview: String = function_declaration
-                    .chars()
-                    .take(300)
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .collect();
-                tracing::debug!(
-                    "Runtime.callFunctionOn awaitPromise took {}ms; fn={}",
-                    __dt.as_millis(),
-                    preview,
-                );
-            }
-
-            // Same rule as evaluate: a rejected call is answered, not failed,
-            // and the value is never serialized by value. Without this the
-            // wrapper stored the error under the object id a success uses, so
-            // a rejection came back as an ordinary result: an Error as `{}`,
-            // and `Promise.reject({code: 42})` as `{code: 42}`, which is
-            // indistinguishable from resolving with it.
-            let rejected = self
-                .execute_runtime_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                return self.thrown_info(&oid);
-            }
-
-            if return_by_value {
-                return self.take_cdp_result_by_value(&oid);
-            }
-
-            let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
-            let meta_str = self.v8_to_json(meta_result)?;
-            let meta_json = if let serde_json::Value::String(s) = &meta_str {
-                serde_json::from_str(s).unwrap_or(meta_str.clone())
-            } else {
-                meta_str
-            };
-            return self.finish_cdp_result(&meta_json, &oid);
+            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
+                object_id: oid, done_counter, recipe: None,
+            }));
         }
 
         if return_by_value {
@@ -2879,7 +2833,7 @@ impl ObscuraJsRuntime {
             let result = self
                 .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
-            return self.v8_to_cdp_value(result);
+            return self.v8_to_cdp_value(result).map(CdpEvaluation::Complete);
         }
 
         let code = format!(
@@ -2907,7 +2861,61 @@ impl ObscuraJsRuntime {
         } else {
             meta_str
         };
-        self.finish_cdp_result(&meta_json, &oid)
+        self.finish_cdp_result(&meta_json, &oid).map(CdpEvaluation::Complete)
+    }
+
+    #[doc(hidden)]
+    pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
+        let counter = pending.done_counter;
+        self.execute_runtime_script("<done?>", format!(
+            "globalThis.__obscura_done_{counter} === true && delete globalThis.__obscura_done_{counter}"
+        )).ok().and_then(|value| self.v8_to_json(value).ok())
+            .and_then(|value| value.as_bool()).unwrap_or(false)
+    }
+
+    #[doc(hidden)]
+    pub fn finish_cdp_evaluation(
+        &mut self,
+        pending: PendingCdpEvaluation,
+        return_by_value: bool,
+    ) -> Result<RemoteObjectInfo, String> {
+        let oid = pending.object_id;
+        let rejected = self.execute_runtime_script(
+            "<readRejected>", "globalThis.__obscura_await_rejected".to_string(),
+        ).map_err(|e| format!("JS error: {e}"))?;
+        if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+            return self.thrown_info(&oid);
+        }
+        if return_by_value { return self.take_cdp_result_by_value(&oid); }
+        let meta = self.execute_runtime_script(
+            "<readMeta>", "globalThis.__obscura_await_meta".to_string(),
+        ).map_err(|e| format!("JS error: {e}"))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta = if let serde_json::Value::String(value) = &meta {
+            serde_json::from_str(value).unwrap_or(meta)
+        } else { meta };
+        let info = self.finish_cdp_result(&meta, &oid)?;
+        if info.object_id.is_some() {
+            if let Some(recipe) = pending.recipe { self.evaluation_recipes.insert(oid, recipe); }
+        }
+        Ok(info)
+    }
+
+    async fn await_cdp_evaluation(
+        &mut self,
+        evaluation: CdpEvaluation,
+        return_by_value: bool,
+        timeout_ms: u64,
+        method: &str,
+    ) -> Result<RemoteObjectInfo, String> {
+        let pending = match evaluation {
+            CdpEvaluation::Complete(info) => return Ok(info),
+            CdpEvaluation::Pending(pending) => pending,
+        };
+        if !self.resolve_promises_until(|rt| rt.cdp_evaluation_ready(&pending), timeout_ms).await {
+            return Err(format!("{method} promise did not settle within {timeout_ms}ms"));
+        }
+        self.finish_cdp_evaluation(pending, return_by_value)
     }
     pub async fn call_function_on(
         &mut self,
@@ -22097,8 +22105,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_origin_follows_the_final_redirect_url() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
-        let result = rt
-            .call_function_on_for_cdp(
+        let evaluation = rt
+            .start_cdp_call(
                 r#"async () => {
                     const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
@@ -22127,8 +22135,20 @@ mod tests {
                 true,
                 true,
             )
-            .await
             .unwrap();
+
+        // The embedder owns frame creation and fires the element's load after it.
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let frame = rt.take_pending_frames().remove(0);
+        let realm = crate::frame::FrameRealm::new(
+            &mut rt, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html,
+        ).unwrap();
+        realm.dispatch_load_events(&mut rt).unwrap();
+        rt.execute_script("frame-load", &format!(
+            "globalThis.__obscura_frameElements[{}].dispatchEvent(new Event('load'));", frame.frame_id,
+        )).unwrap();
+        let result = rt.await_cdp_evaluation(evaluation, true, 1_000, "Runtime.callFunctionOn")
+            .await.unwrap();
 
         assert_eq!(
             result.value.unwrap(),
