@@ -516,6 +516,8 @@ pub struct ObscuraState {
     /// parsing/indexing when ordered CSS source and viewport remain identical.
     #[cfg(feature = "render")]
     pub stylesheet_cache: obscura_render::StylesheetCache,
+    #[cfg(feature = "render")]
+    pub(crate) style_query_cache: Option<StyleQueryCache>,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -712,6 +714,8 @@ impl ObscuraState {
             render_resource_backlog: Vec::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
+            #[cfg(feature = "render")]
+            style_query_cache: None,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
@@ -8046,6 +8050,8 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
 
 pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
     state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    { state.style_query_cache = None; }
 }
 
 #[op2(fast)]
@@ -8796,6 +8802,16 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 /// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
 /// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
+pub(crate) struct StyleQueryCache {
+    task_generation: u64,
+    activity_generation: u64,
+    stylesheet_generation: u64,
+    viewport: (f32, f32),
+    media: obscura_render::CssMediaType,
+    cascade: obscura_render::dom::NonGeometricStyleCache,
+}
+
+#[cfg(feature = "render")]
 #[op2]
 #[string]
 fn op_computed_style(
@@ -8815,15 +8831,36 @@ fn op_computed_style(
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
             || prepared.animation_sample() != gs.animation_sample
     }) || !gs.pending_style_mutations.is_empty();
-    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty() {
-        if let Some(snapshot) = gs.dom.as_ref().and_then(|dom| {
-            obscura_render::dom::computed_style_without_layout(
-                dom, nid, gs.viewport, gs.render_media, &gs.stylesheet_cache, &property,
-            )
+    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty()
+        && obscura_render::dom::NonGeometricStyleCache::supports(&property)
+    {
+        let mut cached = gs.style_query_cache.take();
+        let stylesheet_generation = gs.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation());
+        if !cached.as_ref().is_some_and(|cache| {
+            cache.task_generation == gs.animation_task_generation
+                && cache.activity_generation == gs.activity_generation
+                && cache.stylesheet_generation == stylesheet_generation
+                && cache.viewport == gs.viewport && cache.media == gs.render_media
         }) {
+            cached = gs.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::NonGeometricStyleCache::new(
+                    dom, gs.viewport, gs.render_media, &gs.stylesheet_cache,
+                )
+            }).map(|cascade| StyleQueryCache {
+                task_generation: gs.animation_task_generation,
+                activity_generation: gs.activity_generation,
+                stylesheet_generation, viewport: gs.viewport, media: gs.render_media, cascade,
+            });
+        }
+        let snapshot = cached.as_mut().and_then(|cache| {
+            cache.cascade.resolve(gs.dom.as_ref()?, nid, &property)
+        });
+        gs.style_query_cache = cached;
+        if let Some(snapshot) = snapshot {
             return serde_json::json!([false, snapshot]).to_string();
         }
     }
+    gs.style_query_cache = None;
     let Some(prepared) = ensure_prepared_render_with_base_url(&mut gs, base_url) else {
         return String::new();
     };
@@ -8838,6 +8875,11 @@ fn op_computed_style(
             |value| serde_json::to_string(value).unwrap_or_else(|_| "none".to_string()),
         );
         return serde_json::json!([true, { "content": content, "display": display }]).to_string();
+    }
+    if pseudo.is_empty() && obscura_render::dom::NonGeometricStyleCache::supports(&property) {
+        if let Some(snapshot) = prepared.computed_non_geometric_style(nid) {
+            return serde_json::json!([false, snapshot]).to_string();
+        }
     }
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
