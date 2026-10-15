@@ -1000,10 +1000,10 @@ fn op_abort_signal_state<'s, 'i>(
 
 /// Dropping a request at any await boundary must emit one failure, including
 /// when cancelling the header future or the separately owned response body.
-struct FetchNetworkGuard {
-    state: std::rc::Weak<RefCell<ObscuraState>>,
-    event: Option<JsNetworkEvent>,
-    cancel: Option<Rc<CancelHandle>>,
+pub(crate) struct FetchNetworkGuard {
+    pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
+    pub(crate) event: Option<JsNetworkEvent>,
+    pub(crate) cancel: Option<Rc<CancelHandle>>,
 }
 
 impl Drop for FetchNetworkGuard {
