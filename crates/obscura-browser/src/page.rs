@@ -4793,6 +4793,11 @@ impl Page {
         self.js.is_some()
     }
 
+    /// Origin-scoped sessionStorage for this tab, including inactive origins.
+    pub fn session_storage(&self) -> &OriginStorage {
+        &self.session_storage
+    }
+
     pub fn has_pending_indexed_db_notifications(&self) -> bool {
         self.context.indexed_db.has_pending_notifications()
     }

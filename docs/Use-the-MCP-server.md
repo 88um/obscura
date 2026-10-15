@@ -98,6 +98,16 @@ Cookies and storage:
 
 - `browser_get_cookies`, `browser_set_cookie`, `browser_clear_cookies`, `browser_storage_state`, `browser_set_storage_state`
 
+Storage-state export includes localStorage for all stored origins and
+sessionStorage for all stored origins in the active tab. Restoration merges
+the supplied keys into their declared origins and can run before navigation.
+Restored sessionStorage belongs only to the active tab, creating a default
+tab if needed; localStorage and cookies belong to the browser context.
+Origins must be canonical HTTP(S) origins, and storage entries are `[key, value]`
+string pairs. Invalid input is rejected before mutation. A quota failure returns
+a tool error and reports that preceding writes may already have been applied.
+Cookie entries pass through the browser's existing cookie validation.
+
 Tabs:
 
 - `browser_tab_new`, `browser_tab_list`, `browser_tab_switch`, `browser_tab_close`
