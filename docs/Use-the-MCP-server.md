@@ -102,6 +102,11 @@ Element references describe the current rendered page state and can become
 stale after navigation, interaction, scrolling, or a framework rerender. Take
 a fresh snapshot or interactive-element listing before acting again.
 
+Treat references as opaque tokens. Each new snapshot or interactive-element
+listing invalidates the previous tokens. A reference targets the original
+native element, not a replacement or clone that copies its attributes; stale
+references return a tool error instead of acting on a different element.
+
 MCP exposes still-image and PDF output. It does not stream video frames; use
 CDP `Page.startScreencast` for activity-driven screencasting.
 
