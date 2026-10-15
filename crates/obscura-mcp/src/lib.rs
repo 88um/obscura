@@ -177,9 +177,13 @@ impl BrowserState {
     /// so leaving either half for the next tool call strands timers, fetches,
     /// and location/form/click navigations while the transport waits on stdin.
     async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
-        let page = self.page_mut();
-        let reached_idle = page.run_autonomous_event_loop_turn().await?;
-        let navigated = page
+        let reached_idle = self.page_mut().run_autonomous_event_loop_turn().await?;
+        self.finish_active_page_turn(reached_idle).await
+    }
+
+    // Complete navigation outside the cancelable wait: it consumes pending state before I/O.
+    async fn finish_active_page_turn(&mut self, reached_idle: bool) -> Result<bool, String> {
+        let navigated = self.page_mut()
             .process_pending_navigation()
             .await
             .map_err(|error| error.to_string())?;
@@ -279,7 +283,11 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             tokio::select! {
                 biased;
                 read = reader.read_line(&mut line) => Some(read?),
-                pump_result = state.advance_active_page_tasks() => {
+                pump_result = state.page_mut().run_autonomous_event_loop_turn() => {
+                    let pump_result = match pump_result {
+                        Ok(reached_idle) => state.finish_active_page_turn(reached_idle).await,
+                        Err(error) => Err(error),
+                    };
                     match pump_result {
                         Ok(reached_idle) => runtime_pump_armed = !reached_idle,
                         Err(error) => {

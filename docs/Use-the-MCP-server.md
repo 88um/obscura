@@ -56,6 +56,10 @@ OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
 
 The server keeps a live browser session, so tools operate on the current page rather than taking a URL each call. Navigate first, then read or act.
 
+The active page continues running timers and network callbacks between tool
+calls over both stdio and HTTP. Task driving is wake-driven and parks when
+the page is idle; a future timer does not block incoming MCP requests.
+
 Navigation and lifecycle:
 
 - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`, `browser_close`
