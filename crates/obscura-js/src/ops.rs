@@ -354,6 +354,8 @@ pub struct ObscuraState {
     /// origin: an entry survives realm teardown on a same-origin navigation but
     /// never leaves the tab (issue #678).
     pub session_storage: Option<Arc<OriginStorage>>,
+    pub indexed_db: Arc<crate::indexed_db::IndexedDbStorage>,
+    pub(crate) indexed_db_owner: Option<crate::indexed_db::IndexedDbOwner>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -600,6 +602,7 @@ impl ObscuraState {
         // own bucket instead of the top document's.
         self.local_storage = parent.local_storage.clone();
         self.session_storage = parent.session_storage.clone();
+        self.indexed_db = parent.indexed_db.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
         self.encoding = parent.encoding.clone();
@@ -635,6 +638,8 @@ impl ObscuraState {
             cookie_jar: None,
             local_storage: Some(Arc::new(OriginStorage::default())),
             session_storage: Some(Arc::new(OriginStorage::default())),
+            indexed_db: Arc::new(crate::indexed_db::IndexedDbStorage::default()),
+            indexed_db_owner: None,
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -6163,6 +6168,30 @@ fn op_storage_access(scope: &mut v8::PinScope, state: &OpState) -> bool {
     &*origin != "null"
 }
 
+#[op2]
+#[string]
+fn op_indexed_db(scope: &mut v8::PinScope, state: &OpState, #[string] action: &str, #[string] payload: &str) -> String {
+    if payload.len() > 24 * 1024 * 1024 { return "{\"error\":\"QuotaExceededError\"}".into(); }
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    if gs.indexed_db_owner.is_none() {
+        gs.indexed_db_owner = Some(crate::indexed_db::IndexedDbOwner::new(gs.indexed_db.clone()));
+    }
+    let origin = storage_origin(&gs);
+    let result = serde_json::from_str(payload).map(|data|
+        gs.indexed_db_owner.as_ref().map(|owner| if action == "notices" {
+            serde_json::json!(owner.take_notices())
+        } else { owner.command(&origin, action, data) }).unwrap_or_default())
+        .unwrap_or_else(|_| serde_json::json!({"error":"DataError"}));
+    result.to_string()
+}
+
+#[op2(fast)]
+#[number]
+fn op_indexed_db_task(state: &OpState) -> u64 {
+    state.borrow::<SharedState>().borrow().animation_task_generation
+}
+
 fn origin_storage_command(
     storage: &Option<Arc<OriginStorage>>,
     origin: &str,
@@ -7488,6 +7517,8 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_storage_access(),
+        op_indexed_db(),
+        op_indexed_db_task(),
         op_local_storage(),
         op_session_storage(),
         op_navigate(),

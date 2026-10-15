@@ -1534,6 +1534,13 @@ async fn pump_live_page_event_loop(
     ctx: &mut CdpContext,
     idle_pages: &mut HashSet<String>,
 ) -> Result<bool, String> {
+    pump_page_event_loops(ctx.pages.iter_mut(), idle_pages).await
+}
+
+pub(crate) async fn pump_page_event_loops<'a>(
+    pages: impl Iterator<Item = &'a mut obscura_browser::Page>,
+    idle_pages: &mut HashSet<String>,
+) -> Result<bool, String> {
     use std::future::Future;
     use std::task::Poll;
 
@@ -1542,9 +1549,11 @@ async fn pump_live_page_event_loop(
     // A completed turn can emit events even when it leaves its page idle.
     // Publish it now, then omit idle pages until a command schedules new work;
     // otherwise an idle peer would keep a waiting connection spinning.
-    let mut turns: Vec<_> = ctx.pages.iter_mut()
-        .filter(|page| page.has_js() && !idle_pages.contains(&page.id))
-        .map(|page| (page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+    let mut turns: Vec<_> = pages.filter_map(|page| {
+            if page.has_pending_indexed_db_notifications() { idle_pages.remove(&page.id); }
+            if !page.has_js() || idle_pages.contains(&page.id) { return None; }
+            Some((page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+        })
         .collect();
     std::future::poll_fn(|cx| {
         let mut all_idle = true;
@@ -3715,6 +3724,44 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
         assert_eq!(response["id"], 18);
         assert!(reply_rx.try_recv().is_err(), "abort emits one failure and one response");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexeddb_versionchange_rearms_an_idle_page_until_its_delayed_close() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = ctx.create_page();
+            let session = Some(format!("{id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(),id.clone());
+            crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<body>idb</body>"}), &mut ctx, &session).await.unwrap();
+            ctx.get_page_mut(&id).unwrap().js.as_mut().unwrap().set_url("https://idb.test/");
+            ids.push(id);
+        }
+        let mut idle = Default::default();
+        ctx.get_page_mut(&ids[0]).unwrap().evaluate(r#"(() => {
+            const r = indexedDB.open('idle-upgrade',1);
+            globalThis.opened = false;
+            r.onsuccess = () => {globalThis.opened = true;
+                r.result.onversionchange = () => setTimeout(() => r.result.close(),10);};
+        })()"#);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap() {}
+        }).await.unwrap();
+        assert!(idle.contains(&ids[0]));
+        assert_eq!(ctx.get_page_mut(&ids[0]).unwrap().evaluate("opened"),json!(true));
+        ctx.get_page_mut(&ids[1]).unwrap().evaluate(r#"(() => {
+            globalThis.upgraded = false;
+            setTimeout(() => {const r = indexedDB.open('idle-upgrade',2);
+                r.onsuccess = () => globalThis.upgraded = r.result.version === 2;},10);
+        })()"#);
+        idle.remove(&ids[1]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap();
+                if ctx.get_page_mut(&ids[1]).unwrap().evaluate("upgraded") == json!(true) {break;}
+            }
+        }).await.expect("versionchange must wake the idle page and retain its delayed-close work");
     }
 
     #[tokio::test(flavor = "current_thread")]

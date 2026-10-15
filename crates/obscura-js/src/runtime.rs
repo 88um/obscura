@@ -556,6 +556,29 @@ impl ObscuraJsRuntime {
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
         begin_animation_task(&mut self.state.borrow_mut());
+        self.poll_indexed_db_notifications();
+    }
+
+    fn poll_indexed_db_notifications(&mut self) {
+        if !self.state.borrow().indexed_db.has_pending_notifications() { return; }
+        let root_notices = self.state.borrow().indexed_db_owner.as_ref()
+            .map(|owner| owner.take_notices()).unwrap_or_default();
+        let realms = self.realm_states().borrow().media_realms();
+        let mut deliveries = Vec::new();
+        if !root_notices.is_empty() {
+            deliveries.push((self.runtime().main_context(), root_notices));
+        }
+        for (context, state) in realms {
+            let notices = state.borrow().indexed_db_owner.as_ref()
+                .map(|owner| owner.take_notices()).unwrap_or_default();
+            if !notices.is_empty() { deliveries.push((context, notices)); }
+        }
+        for (context, notices) in deliveries {
+            let script = format!("globalThis.__obscura_poll_indexeddb({});", serde_json::json!(notices));
+            if let Err(error) = self.eval_in_realm(&context, &script) {
+                tracing::warn!("IndexedDB notification failed: {error}");
+            }
+        }
     }
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
@@ -1172,6 +1195,12 @@ impl ObscuraJsRuntime {
     /// the BrowserContext, so entries outlive the V8 realm that wrote them.
     pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
         self.state.borrow_mut().local_storage = Some(storage);
+    }
+
+    pub fn set_indexed_db(&self, storage: std::sync::Arc<crate::indexed_db::IndexedDbStorage>) {
+        let mut state = self.state.borrow_mut();
+        state.indexed_db_owner = None;
+        state.indexed_db = storage;
     }
 
     /// Install the page-owned `sessionStorage` backing store, so an entry

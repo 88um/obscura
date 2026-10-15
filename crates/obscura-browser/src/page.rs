@@ -1853,6 +1853,7 @@ impl Page {
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         // Web Storage lives outside the realm so a navigation cannot drop it.
         rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_indexed_db(self.context.indexed_db.clone());
         rt.set_session_storage(self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
@@ -4758,6 +4759,10 @@ impl Page {
         self.js.is_some()
     }
 
+    pub fn has_pending_indexed_db_notifications(&self) -> bool {
+        self.context.indexed_db.has_pending_notifications()
+    }
+
     pub fn release_object_group(&mut self) {
         if let Some(js) = &mut self.js {
             js.release_object_group();
@@ -6786,6 +6791,55 @@ mod tests {
         let back = page.evaluate("localStorage.getItem('l1')");
         assert_eq!(back.as_str(), Some("local-value"));
         assert_eq!(page.evaluate("sessionStorage.getItem('s1')").as_str(), Some("session-value"));
+    }
+
+    #[tokio::test]
+    async fn indexeddb_records_survive_navigation_and_share_only_their_context_and_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin_a, _) = spawn_storage_server().await;
+        let (origin_b, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::new("idb-shared".into()));
+        let mut first = storage_page("idb-first", context.clone());
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(r#"(() => {
+            globalThis.idbSaved = false;
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const tx = r.result.transaction('items','readwrite');
+                tx.objectStore('items').put({value:'kept'},1);
+                tx.oncomplete = () => idbSaved = true;
+            };
+        })()"#);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbSaved"), serde_json::json!(true));
+        let read = r#"(() => {
+            globalThis.idbRead = 'pending';
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const q = r.result.transaction('items').objectStore('items').get(1);
+                q.onsuccess = () => idbRead = q.result?.value ?? null;
+            };
+        })()"#;
+        first.navigate(&origin_b).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::Value::Null);
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut second = storage_page("idb-second", context);
+        second.navigate(&origin_a).await.unwrap();
+        second.evaluate(read);
+        second.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(second.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut isolated = storage_page("idb-isolated", std::sync::Arc::new(crate::BrowserContext::new("idb-private".into())));
+        isolated.navigate(&origin_a).await.unwrap();
+        isolated.evaluate(read);
+        isolated.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(isolated.evaluate("idbRead"), serde_json::Value::Null);
     }
 
     #[tokio::test]
