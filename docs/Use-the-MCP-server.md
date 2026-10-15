@@ -80,6 +80,19 @@ Wait and run JS:
 
 - `browser_wait_for`, `browser_wait_for_text`, `browser_evaluate`
 
+`browser_evaluate` accepts JavaScript scripts, executes them once, and waits for
+returned promises. `timeoutMs` defaults to 5000 ms and bounds synchronous
+execution as well as promise settlement. Exceptions, rejected promises, and
+timeouts return MCP tool errors (`isError: true`); a successful JavaScript
+`null` or `undefined` result is still returned as `null` text.
+
+Interaction tools also report execution failures as tool errors.
+Internal interaction and extraction scripts have a five-second execution and
+serialization deadline.
+`browser_fill_form` does not submit if any field fails, and completes a queued
+submit navigation before replying. A failed interaction can have partial side
+effects; take a fresh snapshot before deciding whether to retry.
+
 Diagnostics:
 
 - `browser_network_requests`, `browser_console_messages`
