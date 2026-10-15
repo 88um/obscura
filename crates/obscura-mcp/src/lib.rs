@@ -2242,92 +2242,195 @@ fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
         "same_site": c.same_site,
         "expires": c.expires,
     })).collect();
-    // Pull localStorage + sessionStorage for the current page's origin.
-    let storage_js = r#"(function(){
-        var ls = [], ss = [];
-        try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
-        try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
-        return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
-    })()"#;
-    let storage = if state.active_tab.is_some() {
-        state.page_mut().evaluate(storage_js)
-    } else {
-        Value::Null
-    };
-    let origins = if storage.is_object() { vec![storage] } else { vec![] };
+    let mut origins = std::collections::BTreeMap::new();
+    for (origin, entries) in state.context.local_storage.entries() {
+        let entries: Vec<_> = entries.into_iter().map(|(k, v)| (decode_storage_string(k), decode_storage_string(v))).collect();
+        origins.insert(origin.clone(), json!({
+            "origin": origin, "localStorage": entries, "sessionStorage": []
+        }));
+    }
+    if let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) {
+        for (origin, entries) in page.session_storage().entries() {
+            let entries: Vec<_> = entries.into_iter().map(|(k, v)| (decode_storage_string(k), decode_storage_string(v))).collect();
+            let entry = origins.entry(origin.clone()).or_insert_with(|| json!({
+                "origin": origin, "localStorage": [], "sessionStorage": []
+            }));
+            entry["sessionStorage"] = json!(entries);
+        }
+    }
+    let origins: Vec<_> = origins.into_values().collect();
     let out = json!({ "cookies": cookies, "origins": origins });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+#[derive(Deserialize)]
+struct StorageOrigin {
+    origin: String,
+    #[serde(default, rename = "localStorage")]
+    local_storage: Vec<(String, String)>,
+    #[serde(default, rename = "sessionStorage")]
+    session_storage: Vec<(String, String)>,
+}
+
+// Match the Web Storage bridge's escaping of strings that begin with NUL.
+fn encode_storage_string(value: String) -> String {
+    if value.starts_with('\0') { format!("\0{}", json!(value)) } else { value }
+}
+
+fn decode_storage_string(value: String) -> String {
+    value.strip_prefix('\0')
+        .and_then(|encoded| serde_json::from_str::<String>(encoded).ok())
+        .filter(|decoded| decoded.starts_with('\0'))
+        .unwrap_or(value)
+}
+
 fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
-    let s = args.get("state").ok_or("Missing state object")?;
-    let mut applied = 0u32;
-    // Cookies
-    if let Some(cookies) = s.get("cookies").and_then(Value::as_array) {
-        let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
-            Some(obscura_net::CookieInfo {
-                name: c.get("name")?.as_str()?.to_string(),
-                value: c.get("value")?.as_str()?.to_string(),
-                domain: c.get("domain")?.as_str()?.to_string(),
-                path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
-                secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
-                http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
-                same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
-                expires: c.get("expires").and_then(Value::as_i64),
-            })
-        }).collect();
-        applied += parsed.len() as u32;
-        state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    let s = args.get("state").and_then(Value::as_object).ok_or("Missing state object")?;
+    let origins: Vec<StorageOrigin> = serde_json::from_value(
+        s.get("origins").cloned().unwrap_or_else(|| json!([])),
+    ).map_err(|error| format!("Invalid storage origins: {error}"))?;
+    for entry in &origins {
+        if !url::Url::parse(&entry.origin).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == entry.origin
+        }) {
+            return Err("Storage origins must be canonical http(s) origins without paths or credentials".into());
+        }
     }
-    // Storage (per origin). Only applies if there's an active page; we
-    // restore on whatever origin is currently loaded, which usually
-    // matches because agents navigate before restoring state.
-    if state.active_tab.is_some() {
-        if let Some(origins) = s.get("origins").and_then(Value::as_array) {
-            for origin_entry in origins {
-                let mut snippets = Vec::new();
-                if let Some(arr) = origin_entry.get("localStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ localStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
+    let cookies: &[Value] = match s.get("cookies") {
+        Some(value) => value.as_array().ok_or("cookies must be an array")?,
+        None => &[],
+    };
+    let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().map(|c| {
+        Some(obscura_net::CookieInfo {
+            name: c.get("name")?.as_str()?.to_string(),
+            value: c.get("value")?.as_str()?.to_string(),
+            domain: c.get("domain")?.as_str()?.to_string(),
+            path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
+            secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
+            same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
+            expires: c.get("expires").and_then(Value::as_i64),
+        })
+    }).collect::<Option<Vec<_>>>()
+        .ok_or("Each cookie requires string name, value and domain fields")?;
+    let cookie_count = parsed.len();
+    let mut applied = 0usize;
+    for entry in origins {
+        for (key, value) in entry.local_storage {
+            if !state.context.local_storage.set(&entry.origin, encode_storage_string(key), encode_storage_string(value)) {
+                return Err(format!("localStorage quota exceeded after restoring {applied} web storage entries; restoration may be partial"));
+            }
+            applied += 1;
+        }
+        if !entry.session_storage.is_empty() {
+            let storage = state.page_mut().session_storage();
+            for (key, value) in entry.session_storage {
+                if !storage.set(&entry.origin, encode_storage_string(key), encode_storage_string(value)) {
+                    return Err(format!("sessionStorage quota exceeded after restoring {applied} web storage entries; restoration may be partial"));
                 }
-                if let Some(arr) = origin_entry.get("sessionStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ sessionStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
-                }
-                if !snippets.is_empty() {
-                    let _ = state.page_mut().evaluate(&snippets.join("\n"));
-                }
+                applied += 1;
             }
         }
     }
-    Ok(format!("Restored {applied} state entries."))
+    state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    state.context.save_storage();
+    Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_is_origin_scoped_and_works_before_navigation() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (first, _) = spawn_form_recording_server();
+        let (second, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": first, "localStorage": [["token", "first"]], "sessionStorage": [["tab", "first-session"]]},
+            {"origin": second, "localStorage": [["token", "second"]], "sessionStorage": [["tab", "second-session"]]}
+        ]}}), &mut state).expect("restore before the first navigation");
+        for (origin, local, session) in [(&first, "first", "first-session"), (&second, "second", "second-session")] {
+            state.page_mut().navigate(origin).await.expect("fixture page");
+            assert_eq!(state.page_mut().evaluate("[localStorage.getItem('token'), sessionStorage.getItem('tab')]"),
+                json!([local, session]), "restored values must belong to {origin}");
+        }
+        tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": first, "localStorage": [["token", "updated-first"]]}
+        ]}}), &mut state).expect("restore an inactive origin");
+        assert_eq!(state.page_mut().evaluate("localStorage.getItem('token')"), json!("second"));
+        state.page_mut().navigate(&first).await.expect("return to first origin");
+        assert_eq!(state.page_mut().evaluate("localStorage.getItem('token')"), json!("updated-first"));
+        tool_tab_new(&json!({"url": first}), &mut state).await.expect("second tab");
+        assert_eq!(state.page_mut().evaluate("[localStorage.getItem('token'), sessionStorage.getItem('tab')]"),
+            json!(["updated-first", null]), "restoring a session must not share sessionStorage across tabs");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_export_retains_previously_visited_origins() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (first, _) = spawn_form_recording_server();
+        let (second, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        for (origin, value) in [(&first, "first"), (&second, "second")] {
+            state.page_mut().navigate(origin).await.expect("fixture page");
+            state.page_mut().evaluate(&format!("(function(){{localStorage.setItem('token', '{value}'); sessionStorage.setItem('tab', '{value}-session'); return true;}})()"));
+        }
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        let origins = exported["origins"].as_array().expect("origins");
+        assert_eq!(origins.len(), 2, "export must not omit the previous origin: {exported}");
+        for (origin, value) in [(&first, "first"), (&second, "second")] {
+            let entry = origins.iter().find(|entry| entry["origin"] == json!(origin)).expect("visited origin");
+            assert_eq!(entry["localStorage"], json!([["token", value]]));
+            assert_eq!(entry["sessionStorage"], json!([["tab", format!("{value}-session")]]));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_rejects_invalid_input_before_mutation() {
+        for invalid in [
+            json!({"origin": "null", "localStorage": [["token", "bad"]]}),
+            json!({"origin": "https://other.test/path", "localStorage": [["token", "bad"]]}),
+            json!({"origin": "https://other.test", "localStorage": [["token", 12]]}),
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            let result = tool_set_storage_state(&json!({"state": {"origins": [
+                {"origin": "https://first.test", "localStorage": [["token", "partial"]]}, invalid
+            ]}}), &mut state);
+            assert!(result.is_err(), "invalid state must not report success: {result:?}");
+            assert!(state.context.local_storage.entries().is_empty(), "invalid input must be validated before writes");
+            assert!(state.tabs.is_empty(), "invalid input must not create a tab");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_reports_rejected_quota_writes() {
+        let mut state = BrowserState::new(None, None, false);
+        let result = tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": "https://first.test", "localStorage": [["oversized", "x".repeat(5 * 1024 * 1024 + 1)]]}
+        ]}}), &mut state);
+        assert!(result.is_err(), "rejected native storage writes must not report success");
+        assert!(state.context.local_storage.entries().is_empty(), "rejected value must not be retained");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_state_round_trip_preserves_nul_prefixed_strings() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&origin).await.expect("fixture page");
+        state.page_mut().evaluate(r#"(function(){localStorage.setItem('\0key', '\0"value"'); sessionStorage.setItem('\0tab', '\0session'); return true;})()"#);
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        assert_eq!(exported["origins"][0]["localStorage"], json!([["\0key", "\0\"value\""]]));
+        assert_eq!(exported["origins"][0]["sessionStorage"], json!([["\0tab", "\0session"]]));
+        drop(state);
+        let mut restored = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": exported}), &mut restored).expect("restore");
+        restored.page_mut().navigate(&origin).await.expect("restored page");
+        assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
+            json!(["\0\"value\"", "\0session"]));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn element_refs_reject_copied_attributes_before_clicking() {
