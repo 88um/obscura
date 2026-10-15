@@ -8827,11 +8827,12 @@ fn op_computed_style(
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let base_url = document_base_url_for_javascript_task(&gs);
-    let needs_layout = gs.prepared_render.as_ref().is_none_or(|prepared| {
+    let needs_style_resolution = gs.prepared_render.as_ref().is_none_or(|prepared| {
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
-            || prepared.animation_sample() != gs.animation_sample
     }) || !gs.pending_style_mutations.is_empty();
-    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty()
+    // An animation-only time change can resample the existing frame without
+    // duplicating its style graph in the ancestor-cascade cache.
+    if pseudo.is_empty() && needs_style_resolution && gs.animation_timeline.waapi_nodes().is_empty()
         && obscura_render::dom::NonGeometricStyleCache::supports(&property)
     {
         let mut cached = gs.style_query_cache.take();

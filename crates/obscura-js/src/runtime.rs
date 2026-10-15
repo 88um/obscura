@@ -9095,6 +9095,29 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_animation_only_reads_reuse_the_prepared_frame() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            @keyframes move { to { transform:translateX(20px) } }
+            #box { width:20px; height:20px; color:blue; animation:move 1s linear infinite }
+        </style><div id=box></div>"#);
+        rt.set_viewport(100.0, 100.0);
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(20.0));
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(500);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.display, style.color];
+        })()"#).unwrap(), serde_json::json!(["block", "rgb(0, 0, 255)"]));
+        let state = rt.state.borrow();
+        assert!(state.style_query_cache.is_none(),
+            "animation-only reads must not duplicate an existing retained style graph");
+        assert_eq!(state.prepared_render.as_ref().unwrap().animation_sample(), state.animation_sample);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn computed_style_sibling_reads_do_not_repeat_the_ancestor_cascade() {
         let variables = (0..2500).map(|i| format!("--token-{i}:{i}px;"))
             .collect::<String>();

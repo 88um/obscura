@@ -2295,7 +2295,7 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
     );
     out.insert(
         "visibility",
-        if style.visibility_hidden.unwrap_or(false) {
+        if style.visibility_hidden.unwrap_or(style.computed_visibility_hidden) {
             "hidden"
         } else {
             "visible"
@@ -12609,7 +12609,7 @@ mod tests {
             let mut shared = crate::dom::NonGeometricStyleCache::new(
                 &tree, viewport, crate::CssMediaType::Screen, &cache,
             ).unwrap();
-            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child"] {
+            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child", "hidden"] {
                 let id = tree.get_element_by_id(name).unwrap();
                 let fast = crate::dom::computed_style_without_layout(
                     &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
@@ -12629,7 +12629,7 @@ mod tests {
                     assert_eq!(value, expected[property], "shared {name}.{property} with {active}");
                 }
             }
-            for name in ["inherit", "hidden", "animated", "query"] {
+            for name in ["inherit", "animated", "query"] {
                 assert!(crate::dom::computed_style_without_layout(
                     &tree, tree.get_element_by_id(name).unwrap(), viewport,
                     crate::CssMediaType::Screen, &cache, "display",

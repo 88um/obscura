@@ -1051,6 +1051,7 @@ impl DomLayout {
                 continue;
             };
             let visibility_hidden = style.visibility_hidden.unwrap_or(parent_state.0);
+            style.computed_visibility_hidden = visibility_hidden;
             let opacity_zero = parent_state.1 || style.opacity.is_some_and(|value| value <= 0.0);
             style.effectively_invisible = visibility_hidden || opacity_zero;
             if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
@@ -4555,6 +4556,7 @@ pub struct NonGeometricStyleCache {
     styles: HashMap<NodeId, crate::LayoutStyle>,
     custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     ancestors: HashMap<NodeId, (Option<f32>, bool, bool, bool)>,
+    path: Vec<NodeId>,
 }
 
 #[cfg(feature = "paint")]
@@ -4581,6 +4583,7 @@ impl NonGeometricStyleCache {
         Some(Self {
             has_container_queries: sheet.has_container_queries(), sheet, viewport, quirks,
             styles: HashMap::new(), custom_properties: HashMap::new(), ancestors: HashMap::new(),
+            path: Vec::new(),
         })
     }
 
@@ -4590,29 +4593,38 @@ impl NonGeometricStyleCache {
         if !Self::supports(property) || !tree.is_connected(id) {
             return None;
         }
+        if self.ancestors.contains_key(&id) {
+            return Some(crate::paint::non_geometric_computed_style(self.styles.get(&id)?));
+        }
         let mut path = tree.ancestors(id);
         path.reverse();
         path.push(id);
-        if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)
-            || tree.borrow_node(*node).is_some_and(|node| {
-                node.as_element().is_some_and(|element| element.local.as_ref() == "input")
-                    && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
-            })) {
+        if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)) {
             return None;
         }
+        // Completed branches need their computed values, not another retained
+        // copy of each inherited custom-property environment.
+        let common = self.path.iter().zip(&path).take_while(|(old, new)| old == new).count();
+        for previous in self.path.drain(common..) {
+            self.custom_properties.remove(&previous);
+        }
+        self.path.extend_from_slice(&path[common..]);
         let mut matcher = tree.matcher();
         let mut props = std::rc::Rc::new(HashMap::new());
         let mut cell_padding = None;
         let mut dark = false;
         let mut color = None;
         let mut pointer_events = false;
+        let mut visibility_hidden = false;
         let shadow_sheets = HashMap::new();
         let mut timeline = crate::AnimationTimelineState::default();
         let mut ancestor_display_none = false;
         let mut parent_is_item_container = false;
         let mut root = true;
         for &node in &path {
-            if let Some(&(padding, scheme, hidden, item_container)) = self.ancestors.get(&node) {
+            if let Some(&(padding, scheme, hidden, item_container)) = self.ancestors.get(&node)
+                .filter(|_| self.custom_properties.contains_key(&node))
+            {
                 props = self.custom_properties.get(&node)?.clone();
                 cell_padding = padding;
                 dark = scheme;
@@ -4621,6 +4633,7 @@ impl NonGeometricStyleCache {
                 let style = self.styles.get(&node)?;
                 color = style.color;
                 pointer_events = style.pointer_events_none.unwrap_or(false);
+                visibility_hidden = style.computed_visibility_hidden;
                 root = false;
                 matcher.push_ancestor(tree, node);
                 continue;
@@ -4637,11 +4650,21 @@ impl NonGeometricStyleCache {
             if !element { continue; }
             matcher.push_ancestor(tree, node);
             let style = self.styles.get_mut(&node)?;
+            // Native-control normalization hides this input even against
+            // author display declarations; no intrinsic geometry is needed.
+            if tree.with_node(node, |node| {
+                node.as_element().is_some_and(|element| element.local.as_ref() == "input")
+                    && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
+            }).unwrap_or(false) {
+                style.display = crate::Display::None;
+            }
             ancestor_display_none |= style.display == crate::Display::None;
             // Display inheritance and live effects retain the complete normalization
             // path. A query cannot become active without a query container on this
             // ancestor path, including named normal/style containers.
-            if style.display_inherit || style.animation_name.is_some()
+            if style.display_inherit || style.animation_name.as_deref().is_some_and(|name| {
+                self.sheet.animation_affects_non_geometric_style(name)
+            })
                 || (self.has_container_queries
                     && (style.container_type != crate::ContainerType::Normal
                         || !style.container_names.is_empty()))
@@ -4652,6 +4675,8 @@ impl NonGeometricStyleCache {
             style.color = color;
             pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
             style.pointer_events_none = Some(pointer_events);
+            visibility_hidden = style.visibility_hidden.unwrap_or(visibility_hidden);
+            style.computed_visibility_hidden = visibility_hidden;
             // Normalize before retaining an ancestor for its next descendant.
             if root || (parent_is_item_container && !style.display_contents)
                 || style.position == Some(taffy::Position::Absolute) || style.float.is_some()
@@ -5972,6 +5997,7 @@ fn layout_dom_once(
                     None => style.text_indent = Some(inh.text_indent),
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
+                style.computed_visibility_hidden = inh.visibility_hidden;
                 match style.pointer_events_none {
                     Some(value) => inh.pointer_events_none = value,
                     None => style.pointer_events_none = Some(inh.pointer_events_none),
@@ -15510,6 +15536,127 @@ mod tests {
         }
         tree.remove(source);
         root
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_keeps_custom_property_maps_on_the_active_path() {
+        let branches = (0..32).map(|i| {
+            format!("<section id=branch-{i} style='--local:rgb({i}, 0, 0)'><span id=leaf-{i}>leaf</span><span id=second-{i}>second</span></section>")
+        }).collect::<String>();
+        let tree = parse_html(&format!(r#"<!doctype html><style>body {{ --tone:blue }}
+            section {{ --local:red; color:var(--local) }}</style><body>{branches}</body>"#));
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        for (i, prefix) in (0..32).map(|i| (i, "leaf"))
+            .chain((0..32).rev().map(|i| (i, "second")))
+        {
+            for name in [format!("{prefix}-{i}"), format!("branch-{i}")] {
+                let id = tree.get_element_by_id(&name).unwrap();
+                let result = cache.resolve(&tree, id, "color").unwrap();
+                assert_eq!(result["color"], full.computed_style(id).unwrap()["color"]);
+                assert!(cache.custom_properties.len() <= 4,
+                    "completed sibling branches must not retain inherited custom-property maps");
+            }
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_ignores_unrelated_animation_tracks() {
+        let tree = parse_html(r#"<!doctype html><style>
+            #moving { animation:move 1s linear infinite; color:blue }
+            #unknown { animation:missing 1s infinite }
+            #fading { animation:fade 1s infinite }
+            #color { animation:tint 1s infinite }
+            #visibility { animation:hide 1s infinite }
+            #mixed { animation:mixed 1s infinite }
+            @keyframes move { to { transform:translateX(40px); width:100px } }
+            @keyframes fade { to { opacity:0 } }
+            @keyframes tint { to { color:red; background-color:green } }
+            @keyframes hide { to { visibility:hidden } }
+            @keyframes mixed { to { transform:translateX(40px); opacity:0 } }
+        </style><div id=moving><span id=child>moving</span></div><div id=unknown>unknown</div>
+            <div id=fading>fade</div><div id=color>color</div><div id=visibility>visibility</div><div id=mixed>mixed</div>"#);
+        let mut sheets = crate::StylesheetCache::default();
+        for milliseconds in [0.0, 500.0, 1000.0] {
+            let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+                &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+                &[], &mut sheets, crate::AnimationSampleTime { milliseconds },
+            ).unwrap();
+            let mut cache = NonGeometricStyleCache::new(
+                &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+            ).unwrap();
+            for name in ["child", "moving", "unknown"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let result = cache.resolve(&tree, id, "display")
+                    .expect("unrelated keyframe tracks do not require layout");
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in result {
+                    assert_eq!(value, expected[property], "{name}.{property} at {milliseconds}");
+                }
+            }
+            for name in ["fading", "color", "visibility", "mixed"] {
+                assert!(cache.resolve(&tree, tree.get_element_by_id(name).unwrap(), "display").is_none(),
+                    "{name} animates a value included in the partial snapshot");
+            }
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_preserves_inherited_visibility_across_cached_branches() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { visibility:hidden }
+            #override { visibility:visible }
+            #opacity { visibility:visible; opacity:0 }
+        </style><span id=hidden>hidden</span><div id=override><span id=visible>visible</span></div><span id=opacity>transparent</span>"#);
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        for (name, expected) in [("visible", "visible"), ("hidden", "hidden"), ("override", "visible"), ("opacity", "visible")] {
+            let id = tree.get_element_by_id(name).unwrap();
+            let result = cache.resolve(&tree, id, "visibility").unwrap();
+            assert_eq!(result["visibility"], expected, "{name}");
+            assert_eq!(result["visibility"], full.computed_style(id).unwrap()["visibility"]);
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_resolves_hidden_inputs_without_full_layout() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { color:blue; visibility:hidden; pointer-events:none }
+            input { display:block !important; background-color:red }
+        </style><input id=target type=hidden>"#);
+        let id = tree.get_element_by_id("target").unwrap();
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        let result = cache.resolve(&tree, id, "display").unwrap();
+        assert_eq!(result["display"], "none");
+        assert_eq!(result["visibility"], "hidden");
+        assert_eq!(result["color"], "rgb(0, 0, 255)");
+        let expected = full.computed_style(id).unwrap();
+        for (property, value) in result {
+            assert_eq!(value, expected[property], "hidden input {property}");
+        }
     }
 
     #[test]
