@@ -1246,6 +1246,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
+            gs.style_query_cache = None;
             gs.animation_sample = obscura_render::AnimationSample::default();
             gs.animation_timeline = obscura_render::AnimationTimelineState::default();
             gs.animation_timeline_origin = std::time::Instant::now();
@@ -4071,6 +4072,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
+            state.style_query_cache = None;
             state.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&state);
             state.render_resources = render_resources;
@@ -9088,6 +9090,78 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             ["100px", "30px", "rgb(78, 90, 12)"],
             ["100px", "30px", "rgb(78, 90, 12)"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_sibling_reads_do_not_repeat_the_ancestor_cascade() {
+        let variables = (0..2500).map(|i| format!("--token-{i}:{i}px;"))
+            .collect::<String>();
+        let mut rt = setup_runtime(&format!(r#"<!doctype html><style>
+            body {{ {variables} color:rgb(12,34,56) }}
+            .row {{ display:block; width:var(--token-80); height:1px }}
+            body[data-active=yes] {{ color:rgb(78,90,12) }}
+        </style><body><main><section>{}</section></main></body>"#,
+            "<div class=row></div>".repeat(1024)));
+        // Prime the compiled stylesheet, then leave layout damage pending.
+        rt.evaluate("document.body.getBoundingClientRect().width").unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(rt.evaluate(r#"(() => {
+            let matched = 0;
+            for (const row of document.querySelectorAll('.row')) {
+                const style = getComputedStyle(row);
+                matched += style.display === 'block' && style.color === 'rgb(12, 34, 56)';
+            }
+            return matched;
+        })()"#).unwrap(), serde_json::json!(1024.0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1),
+            "style-only reads serialized the full CSS variable environment: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.body.setAttribute('data-active', 'yes');
+            let matched = 0;
+            for (const row of document.querySelectorAll('.row')) {
+                const style = getComputedStyle(row);
+                matched += style.display === 'block' && style.color === 'rgb(78, 90, 12)';
+            }
+            return matched;
+        })()"#).unwrap(), serde_json::json!(1024.0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1),
+            "sibling style reads repeated their large inherited cascade: {:?}", started.elapsed());
+        assert!(!rt.state.borrow().pending_style_mutations.is_empty());
+        assert_eq!(rt.evaluate("getComputedStyle(document.querySelector('.row')).width").unwrap(),
+            serde_json::json!("80px"));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.querySelector('.row'));
+            return [style.getPropertyValue('--token-80'), style.length > 2500];
+        })()"#).unwrap(), serde_json::json!(["80px", true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_geometric_style_cache_observes_mutations_between_sibling_reads() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            body { --tone:blue; color:var(--tone) }
+            body[data-active=yes] { --tone:red }
+            section { display:flex }
+            .row { display:inline }
+        </style><body><section><span class=row id=first></span>
+            <span class=row id=second></span></section></body>"#);
+        rt.evaluate("document.body.getBoundingClientRect().width").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const first = document.getElementById('first');
+            const second = document.getElementById('second');
+            document.body.setAttribute('data-active', 'yes');
+            const before = getComputedStyle(second).color;
+            document.body.removeAttribute('data-active');
+            const after = getComputedStyle(first).color;
+            document.querySelector('section').style.display = 'block';
+            const display = getComputedStyle(second).display;
+            document.querySelector('style').sheet.insertRule('.row { color:green }', 0);
+            return [before, after, display, getComputedStyle(first).color];
+        })()"#).unwrap(), serde_json::json!([
+            "rgb(255, 0, 0)", "rgb(0, 0, 255)", "inline", "rgb(0, 128, 0)"
         ]));
     }
 

@@ -4540,88 +4540,133 @@ pub fn computed_style_without_layout(
     cache: &crate::css::StylesheetCache,
     property: &str,
 ) -> Option<HashMap<&'static str, String>> {
-    if !matches!(property, "display" | "float" | "clear" | "position" | "z-index"
-        | "visibility" | "pointer-events" | "opacity" | "background-color"
-        | "background-origin" | "background-clip" | "color")
-        || !tree.is_connected(id)
-    {
-        return None;
+    if !NonGeometricStyleCache::supports(property) { return None; }
+    NonGeometricStyleCache::new(tree, viewport, media_type, cache)?.resolve(tree, id, property)
+}
+
+/// Ancestor cascade shared by non-geometric reads in one unchanged JS task.
+/// The owner must discard it on document, style, viewport or media changes.
+#[cfg(feature = "paint")]
+pub struct NonGeometricStyleCache {
+    sheet: std::sync::Arc<crate::css::Stylesheet>,
+    viewport: (f32, f32),
+    quirks: bool,
+    has_container_queries: bool,
+    styles: HashMap<NodeId, crate::LayoutStyle>,
+    custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+    ancestors: HashMap<NodeId, (Option<f32>, bool, bool, bool)>,
+}
+
+#[cfg(feature = "paint")]
+impl NonGeometricStyleCache {
+    pub fn supports(property: &str) -> bool {
+        matches!(property, "display" | "float" | "clear" | "position" | "z-index"
+            | "visibility" | "pointer-events" | "opacity" | "background-color"
+            | "background-origin" | "background-clip" | "color")
     }
-    let sources = document_stylesheet_sources(tree, viewport, media_type);
-    let sheet = cache.get(&sources, viewport, media_type)?;
-    let mut path = tree.ancestors(id);
-    path.reverse();
-    path.push(id);
-    if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)
-        || tree.borrow_node(*node).is_some_and(|node| {
-            node.as_element().is_some_and(|element| element.local.as_ref() == "input")
-                && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
-        })) {
-        return None;
-    }
-    let quirks = !tree.children(tree.document()).iter().any(|node| {
-        tree.borrow_node(*node).is_some_and(|node| {
-            matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
+
+    pub fn new(
+        tree: &DomTree,
+        viewport: (f32, f32),
+        media_type: crate::CssMediaType,
+        cache: &crate::css::StylesheetCache,
+    ) -> Option<Self> {
+        let sources = document_stylesheet_sources(tree, viewport, media_type);
+        let sheet = cache.get(&sources, viewport, media_type)?;
+        let quirks = !tree.children(tree.document()).iter().any(|node| {
+            tree.borrow_node(*node).is_some_and(|node| {
+                matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
+            })
+        });
+        Some(Self {
+            has_container_queries: sheet.has_container_queries(), sheet, viewport, quirks,
+            styles: HashMap::new(), custom_properties: HashMap::new(), ancestors: HashMap::new(),
         })
-    });
-    let mut matcher = tree.matcher();
-    let mut styles = HashMap::new();
-    let mut custom_properties = HashMap::new();
-    let mut props = std::rc::Rc::new(HashMap::new());
-    let mut cell_padding = None;
-    let mut dark = false;
-    let mut color = None;
-    let mut pointer_events = false;
-    let shadow_sheets = HashMap::new();
-    let mut timeline = crate::AnimationTimelineState::default();
-    let mut ancestor_display_none = false;
-    for &node in &path {
-        let (next_props, next_padding, next_dark, element) = cascade_node_style(
-            tree, node, &sheet, &sheet, &shadow_sheets, &mut matcher,
-            &mut styles, &mut custom_properties, &props, &mut None, quirks,
-            viewport, crate::AnimationSample::default(), &mut timeline,
-            cell_padding, dark, None, ancestor_display_none,
-        )?;
-        props = next_props;
-        cell_padding = next_padding;
-        dark = next_dark;
-        if !element { continue; }
-        matcher.push_ancestor(tree, node);
-        let style = styles.get_mut(&node)?;
-        ancestor_display_none |= style.display == crate::Display::None;
-        // Display inheritance and live effects retain the complete normalization
-        // path. A query cannot become active without a query container on this
-        // ancestor path, including named normal/style containers.
-        if style.display_inherit || style.animation_name.is_some()
-            || (sheet.has_container_queries()
-                && (style.container_type != crate::ContainerType::Normal
-                    || !style.container_names.is_empty()))
-        {
+    }
+
+    pub fn resolve(
+        &mut self, tree: &DomTree, id: NodeId, property: &str,
+    ) -> Option<HashMap<&'static str, String>> {
+        if !Self::supports(property) || !tree.is_connected(id) {
             return None;
         }
-        color = style.color.or(color);
-        style.color = color;
-        pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
-        style.pointer_events_none = Some(pointer_events);
-    }
-    // Use the same outer-display fixup as layout, including transparent
-    // display:contents ancestors and flex/grid items.
-    let mut parent_is_item_container = false;
-    let mut root = true;
-    for node in path {
-        let Some(style) = styles.get_mut(&node) else { continue };
-        if root || (parent_is_item_container && !style.display_contents)
-            || style.position == Some(taffy::Position::Absolute) || style.float.is_some()
-        {
-            crate::blockify_outer_display(style);
+        let mut path = tree.ancestors(id);
+        path.reverse();
+        path.push(id);
+        if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)
+            || tree.borrow_node(*node).is_some_and(|node| {
+                node.as_element().is_some_and(|element| element.local.as_ref() == "input")
+                    && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
+            })) {
+            return None;
         }
-        root = false;
-        if !style.display_contents {
-            parent_is_item_container = style.display == crate::Display::Grid
-                || (style.display == crate::Display::Flex && !style.internal_flex_container);
+        let mut matcher = tree.matcher();
+        let mut props = std::rc::Rc::new(HashMap::new());
+        let mut cell_padding = None;
+        let mut dark = false;
+        let mut color = None;
+        let mut pointer_events = false;
+        let shadow_sheets = HashMap::new();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let mut ancestor_display_none = false;
+        let mut parent_is_item_container = false;
+        let mut root = true;
+        for &node in &path {
+            if let Some(&(padding, scheme, hidden, item_container)) = self.ancestors.get(&node) {
+                props = self.custom_properties.get(&node)?.clone();
+                cell_padding = padding;
+                dark = scheme;
+                ancestor_display_none = hidden;
+                parent_is_item_container = item_container;
+                let style = self.styles.get(&node)?;
+                color = style.color;
+                pointer_events = style.pointer_events_none.unwrap_or(false);
+                root = false;
+                matcher.push_ancestor(tree, node);
+                continue;
+            }
+            let (next_props, next_padding, next_dark, element) = cascade_node_style(
+                tree, node, &self.sheet, &self.sheet, &shadow_sheets, &mut matcher,
+                &mut self.styles, &mut self.custom_properties, &props, &mut None, self.quirks,
+                self.viewport, crate::AnimationSample::default(), &mut timeline,
+                cell_padding, dark, None, ancestor_display_none,
+            )?;
+            props = next_props;
+            cell_padding = next_padding;
+            dark = next_dark;
+            if !element { continue; }
+            matcher.push_ancestor(tree, node);
+            let style = self.styles.get_mut(&node)?;
+            ancestor_display_none |= style.display == crate::Display::None;
+            // Display inheritance and live effects retain the complete normalization
+            // path. A query cannot become active without a query container on this
+            // ancestor path, including named normal/style containers.
+            if style.display_inherit || style.animation_name.is_some()
+                || (self.has_container_queries
+                    && (style.container_type != crate::ContainerType::Normal
+                        || !style.container_names.is_empty()))
+            {
+                return None;
+            }
+            color = style.color.or(color);
+            style.color = color;
+            pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
+            style.pointer_events_none = Some(pointer_events);
+            // Normalize before retaining an ancestor for its next descendant.
+            if root || (parent_is_item_container && !style.display_contents)
+                || style.position == Some(taffy::Position::Absolute) || style.float.is_some()
+            {
+                crate::blockify_outer_display(style);
+            }
+            root = false;
+            if !style.display_contents {
+                parent_is_item_container = style.display == crate::Display::Grid
+                    || (style.display == crate::Display::Flex && !style.internal_flex_container);
+            }
+            self.ancestors.insert(node, (cell_padding, dark, ancestor_display_none, parent_is_item_container));
         }
+        Some(crate::paint::non_geometric_computed_style(self.styles.get(&id)?))
     }
-    Some(crate::paint::non_geometric_computed_style(styles.get(&id)?))
 }
 
 fn document_stylesheet_sources(
