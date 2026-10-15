@@ -4707,10 +4707,7 @@ class Element extends Node {
         const html = response.body || '';
         const loadedUrl = response.url || fullUrl;
         el._iframeLoadedUrl = loadedUrl;
-        // Hand the document to the host, which gives this frame a realm of its
-        // own and runs the scripts that came with it (issue #600). The shim
-        // document below stays: it is what the parent reads through
-        // contentDocument.
+        // The host fires load after creating the realm and running its scripts.
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
@@ -4725,6 +4722,7 @@ class Element extends Node {
           el._iframeWin._frameId = el._frameId;
           globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
           globalThis.__obscura_frameElements[el._frameId] = el;
+          return;
         }
       } else {
         el._iframeLoadedUrl = fullUrl;
