@@ -4362,6 +4362,11 @@ impl Page {
         }
     }
 
+    /// Run a script and preserve JavaScript execution errors. The caller owns its deadline.
+    pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?.evaluate_script(script)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {
@@ -4554,13 +4559,18 @@ impl Page {
                     ready = js.cdp_evaluation_ready(&pending);
                     ready || queued || js.has_pending_frame_tasks()
                 }, duration_millis_u64(remaining)).await;
-                if ready { return js.finish_cdp_evaluation(pending, return_by_value); }
+                if ready { return Ok(()); }
                 if !progressed { return Err(format!("{method} promise did not settle within {timeout_ms}ms")); }
                 self.advance_frames().await;
             }
         };
-        tokio::time::timeout_at(deadline, wait).await
-            .unwrap_or_else(|_| Err(format!("{method} promise did not settle within {timeout_ms}ms")))
+        let result = tokio::time::timeout_at(deadline, wait).await
+            .unwrap_or_else(|_| Err(format!("{method} promise did not settle within {timeout_ms}ms")));
+        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+        match result {
+            Ok(()) => js.finish_cdp_evaluation(pending, return_by_value),
+            Err(error) => { js.cancel_cdp_evaluation(pending); Err(error) }
+        }
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {

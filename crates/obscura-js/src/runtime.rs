@@ -241,7 +241,6 @@ pub enum CdpEvaluation {
 #[doc(hidden)]
 pub struct PendingCdpEvaluation {
     object_id: String,
-    done_counter: u64,
     recipe: Option<String>,
 }
 
@@ -294,6 +293,8 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    // Pending commands are runtime-owned, not client handles that releaseObjectGroup can discard.
+    pending_cdp_evaluations: HashMap<String, v8::Global<v8::Value>>,
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
@@ -687,6 +688,7 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            pending_cdp_evaluations: HashMap::new(),
             js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
@@ -2571,6 +2573,15 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
+    /// Evaluate a script without converting an exception into a null result.
+    pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
+        self.begin_javascript_task();
+        let result = self.execute_runtime_script("<eval-script>", script.to_owned())?;
+        self.v8_to_json(result)
+    }
+
     pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
@@ -2632,32 +2643,20 @@ impl ObscuraJsRuntime {
         // where `var` lands on `globalThis` the way it does in Chrome, and
         // cannot see this wrapper's `__result`.
         let source_literal = serde_json::Value::String(expression.to_string());
-        let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
-                "(async function() {{\n\
-                    try {{\n\
-                        var __result = await (0, eval)({src});\n\
-                        globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                    }}\n\
-                    globalThis.__obscura_done_{done_counter} = true;\n\
+                "(function() {{\n\
+                    var pending = {{done:false,rejected:false,value:undefined}};\n\
+                    (async function() {{\n\
+                        try {{ pending.value = await (0, eval)({src}); }}\n\
+                        catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
+                        pending.done = true;\n\
+                    }})();\n\
+                    return pending;\n\
                 }})()",
                 src = source_literal,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-                done_counter = done_counter,
             )
         } else {
-            // The synchronous half writes the same two globals as the await
-            // half above, so one outcome protocol covers both and the reply
-            // builder does not have to care which path produced the value.
             // Before this, a throw here became `__result = undefined`: the
             // command answered successfully with `undefined`, so a page error
             // was indistinguishable from an expression with no value.
@@ -2688,8 +2687,9 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("JS error: {}", e))?;
 
         if await_promise {
+            self.pending_cdp_evaluations.insert(oid.clone(), result);
             return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid, done_counter,
+                object_id: oid,
                 recipe: if return_by_value { None } else { Some(expression.to_string()) },
             }));
         }
@@ -2777,43 +2777,32 @@ impl ObscuraJsRuntime {
         let oid = self.make_oid(self.object_counter);
 
         if await_promise {
-            let done_counter = self.object_counter;
-            let err_meta_fn = Self::meta_extract_js("__result");
             let code = format!(
-                "(async function() {{\n\
-                    {setup}\n\
-                    var __fn = ({fn_decl});\n\
-                    var __this = ({this_expr});\n\
-                    var __result;\n\
-                    try {{\n\
-                        __result = await __fn.call(__this, {args});\n\
-                        globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
-                    }} catch(e) {{\n\
-                        __result = e;\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                    }} finally {{\n\
-                        globalThis.__obscura_done_{done_counter} = true;\n\
-                    }}\n\
+                "(function() {{\n\
+                    var pending = {{done:false,rejected:false,value:undefined}};\n\
+                    (async function() {{\n\
+                        try {{\n\
+                            {setup}\n\
+                            var __fn = ({fn_decl});\n\
+                            var __this = ({this_expr});\n\
+                            pending.value = await __fn.call(__this, {args});\n\
+                        }} catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
+                        pending.done = true;\n\
+                    }})();\n\
+                    return pending;\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
                 this_expr = this_expr,
                 args = args_list,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = err_meta_fn,
-                done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
+            let record = self.execute_runtime_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
+            self.pending_cdp_evaluations.insert(oid.clone(), record);
 
             return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid, done_counter, recipe: None,
+                object_id: oid, recipe: None,
             }));
         }
 
@@ -2866,11 +2855,17 @@ impl ObscuraJsRuntime {
 
     #[doc(hidden)]
     pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
-        let counter = pending.done_counter;
-        self.execute_runtime_script("<done?>", format!(
-            "globalThis.__obscura_done_{counter} === true && delete globalThis.__obscura_done_{counter}"
-        )).ok().and_then(|value| self.v8_to_json(value).ok())
-            .and_then(|value| value.as_bool()).unwrap_or(false)
+        let Some(record) = self.pending_cdp_evaluations.get(&pending.object_id).cloned() else {
+            return false;
+        };
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        let Ok(record) = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record)) else {
+            return false;
+        };
+        let Some(key) = v8::String::new(scope, "done") else { return false; };
+        record.get(scope, key.into()).is_some_and(|value| value.is_true())
     }
 
     #[doc(hidden)]
@@ -2880,25 +2875,54 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
     ) -> Result<RemoteObjectInfo, String> {
         let oid = pending.object_id;
-        let rejected = self.execute_runtime_script(
-            "<readRejected>", "globalThis.__obscura_await_rejected".to_string(),
-        ).map_err(|e| format!("JS error: {e}"))?;
-        if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid);
-        }
-        if return_by_value { return self.take_cdp_result_by_value(&oid); }
+        let record = self.pending_cdp_evaluations.remove(&oid)
+            .ok_or("Evaluation result unavailable")?;
+        let (value, rejected) = {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let record = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record))
+                .map_err(|_| "Invalid evaluation record")?;
+            let done_key = v8::String::new(scope, "done").ok_or("Cannot read evaluation result")?;
+            if !record.get(scope, done_key.into()).is_some_and(|value| value.is_true()) {
+                return Err("Evaluation result unavailable".into());
+            }
+            let rejected_key = v8::String::new(scope, "rejected").ok_or("Cannot read evaluation result")?;
+            let rejected = record.get(scope, rejected_key.into()).is_some_and(|value| value.is_true());
+            let value_key = v8::String::new(scope, "value").ok_or("Cannot read evaluation result")?;
+            let value = record.get(scope, value_key.into()).ok_or("Cannot read evaluation result")?;
+            if !return_by_value || rejected {
+                let objects_key = v8::String::new(scope, "__obscura_objects").ok_or("Cannot store evaluation result")?;
+                let global = scope.get_current_context().global(scope);
+                let objects = global.get(scope, objects_key.into())
+                    .and_then(|value| value.to_object(scope)).ok_or("Cannot store evaluation result")?;
+                let key = v8::String::new(scope, &oid).ok_or("Cannot store evaluation result")?;
+                if objects.set(scope, key.into(), value) != Some(true) {
+                    return Err("Cannot store evaluation result".into());
+                }
+            }
+            (v8::Global::new(scope, value), rejected)
+        };
+        if return_by_value && !rejected { return self.v8_to_cdp_value(value); }
         let meta = self.execute_runtime_script(
-            "<readMeta>", "globalThis.__obscura_await_meta".to_string(),
+            "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
         ).map_err(|e| format!("JS error: {e}"))?;
         let meta = self.v8_to_json(meta)?;
         let meta = if let serde_json::Value::String(value) = &meta {
             serde_json::from_str(value).unwrap_or(meta)
         } else { meta };
-        let info = self.finish_cdp_result(&meta, &oid)?;
-        if info.object_id.is_some() {
+        let mut info = self.finish_cdp_result(&meta, &oid)?;
+        info.thrown = rejected;
+        if !rejected && info.object_id.is_some() {
             if let Some(recipe) = pending.recipe { self.evaluation_recipes.insert(oid, recipe); }
         }
         Ok(info)
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_cdp_evaluation(&mut self, pending: PendingCdpEvaluation) {
+        self.pending_cdp_evaluations.remove(&pending.object_id);
     }
 
     async fn await_cdp_evaluation(
@@ -2913,6 +2937,7 @@ impl ObscuraJsRuntime {
             CdpEvaluation::Pending(pending) => pending,
         };
         if !self.resolve_promises_until(|rt| rt.cdp_evaluation_ready(&pending), timeout_ms).await {
+            self.cancel_cdp_evaluation(pending);
             return Err(format!("{method} promise did not settle within {timeout_ms}ms"));
         }
         self.finish_cdp_evaluation(pending, return_by_value)
@@ -19417,10 +19442,70 @@ mod tests {
         assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
     }
 
-    // This test used to assert that a rejection came back as `Err`. It does
-    // not any more, and the old expectation was the defect: CDP answers the
-    // command and reports the rejected value through `exceptionDetails`, so
-    // failing the command loses the page error rather than delivering it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn releasing_remote_objects_keeps_inflight_evaluations_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let first = rt.start_cdp_evaluation(
+            "new Promise(resolve=>{globalThis.finishFirst=resolve})", true, true,
+        ).unwrap();
+        let second = rt.start_cdp_call(
+            "()=>new Promise(resolve=>setTimeout(()=>{finishFirst(42);resolve({answer:7})},1))",
+            None, &[], false, true,
+        ).unwrap();
+        let CdpEvaluation::Pending(first) = first else { panic!("expected pending evaluation"); };
+        let CdpEvaluation::Pending(second) = second else { panic!("expected pending evaluation"); };
+        rt.release_object_group();
+        assert!(rt.resolve_promises_until(|rt| rt.cdp_evaluation_ready(&first) && rt.cdp_evaluation_ready(&second), 100).await,
+            "releasing client object handles must not discard an inflight evaluation");
+        let result = rt.finish_cdp_evaluation(second, false).unwrap();
+        let answer = rt.call_function_on_for_cdp("function(){return this.answer}", result.object_id.as_deref(), &[], true, false).await.unwrap();
+        assert_eq!(answer.value.as_ref().and_then(serde_json::Value::as_f64), Some(7.0));
+        rt.release_object_group();
+        let result = rt.finish_cdp_evaluation(first, true).unwrap();
+        assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+        assert!(rt.pending_cdp_evaluations.is_empty(), "completed commands must release their native roots");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_timed_out_rejection_cannot_poison_a_later_success() {
+        for call_function in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            assert!(rt.evaluate_for_cdp_with_timeout(
+                "new Promise((resolve,reject)=>{globalThis.rejectOld=reject})", true, true, 10,
+            ).await.is_err());
+            assert!(rt.pending_cdp_evaluations.is_empty(), "timed-out commands must release their native roots");
+            rt.release_object_group();
+            let body = "Promise.resolve().then(()=>queueMicrotask(()=>rejectOld(new Error('old-rejection'))));return 42;";
+            let result = if call_function {
+                rt.call_function_on_for_cdp(&format!("function(){{{body}}}"), None, &[], true, true).await
+            } else {
+                rt.evaluate_for_cdp(&format!("(function(){{{body}}})()"), true, true).await
+            }.unwrap();
+            assert!(!result.thrown, "an older rejected callback contaminated this call: {}", result.description);
+            assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_timed_out_success_cannot_hide_a_later_rejection() {
+        for call_function in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            assert!(rt.evaluate_for_cdp_with_timeout(
+                "new Promise(resolve=>{globalThis.resolveOld=resolve})", true, true, 10,
+            ).await.is_err());
+            rt.release_object_group();
+            let body = "Promise.resolve().then(()=>queueMicrotask(()=>resolveOld(99)));return Promise.reject(new Error('current-failure'));";
+            let result = if call_function {
+                rt.call_function_on_for_cdp(&format!("function(){{{body}}}"), None, &[], true, true).await
+            } else {
+                rt.evaluate_for_cdp(&format!("(function(){{{body}}})()"), true, true).await
+            }.unwrap();
+            assert!(result.thrown, "an older resolved callback hid this call's rejection: {:?}", result.value);
+            assert!(result.description.contains("current-failure"), "{}", result.description);
+        }
+    }
+
+    // CDP answers the command and reports rejections through exceptionDetails.
     #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_reports_promise_rejection() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -19590,9 +19675,7 @@ mod tests {
     
     #[tokio::test(flavor = "current_thread")]
     async fn a_rejection_does_not_leak_into_the_next_call() {
-        // `__obscura_await_rejected` is a global, so the success branch has to
-        // clear it. Without that the first rejection would mark every later
-        // call on the same runtime as thrown.
+        // Completed calls must not carry rejection state into either API entrypoint.
         let mut rt = setup_runtime("<html><body></body></html>");
         let rejected = rt
             .call_function_on_for_cdp(

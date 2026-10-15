@@ -835,7 +835,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_wait_for_text" => tool_wait_for_text(args, state).await,
         // Tier 2 agent-UX additions
         "browser_detect_forms" => tool_detect_forms(state),
-        "browser_fill_form" => tool_fill_form(args, state),
+        "browser_fill_form" => tool_fill_form(args, state).await,
         "browser_scroll" => tool_scroll(args, state),
         "browser_get_attribute" => tool_get_attribute(args, state),
         "browser_count" => tool_count(args, state),
@@ -973,6 +973,17 @@ fn resolve_target(args: &Value, state: &BrowserState) -> Result<String, String> 
     Err("Missing 'ref' or 'selector' parameter".to_string())
 }
 
+fn evaluate_tool_script(page: &mut Page, script: &str) -> Result<Value, String> {
+    // Keep the watchdog armed through result serialization, which can run page code.
+    let watchdog = page.js.as_mut().ok_or("Navigate before evaluating JavaScript")?
+        .arm_watchdog(std::time::Duration::from_secs(5));
+    let result = page.evaluate_script(script);
+    if page.js.as_mut().expect("evaluation runtime").disarm_watchdog(watchdog) {
+        return Err("JavaScript execution or serialization exceeded the 5000ms deadline".into());
+    }
+    result
+}
+
 /// Clamp text to `max_chars` and tack on a `...(truncated, N more chars)`
 /// marker so the agent can ask for more if needed. Default ceiling is
 /// 4 KiB to prevent a single tool call from consuming a window of context.
@@ -1063,7 +1074,7 @@ async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, St
         sel = serde_json::to_string(&selector).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1093,7 +1104,7 @@ async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, Str
         val = serde_json::to_string(value).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1119,7 +1130,7 @@ async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, Str
         txt = serde_json::to_string(text).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1150,7 +1161,10 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
         key = serde_json::to_string(key).unwrap()
     );
 
-    state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
+    if result.as_str() == Some("error:element not found") {
+        return Err("Element not found for key press".into());
+    }
     state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }
@@ -1176,7 +1190,7 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
         val = serde_json::to_string(value).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     match result.as_str() {
         Some("error:element not found") => Err(format!("Element not found: {selector}")),
         Some("error:option not found") => Err(format!("Option not found: {value}")),
@@ -1184,104 +1198,29 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
     }
 }
 
-/// Wrap an expression so a thenable it returns can be polled to settlement.
-/// Separate from the polling loop so its shape can be asserted directly: a
-/// wrapper that dereferences its slot before creating it turns every
-/// synchronous expression into "did not settle".
-fn expression_wrapper(expression: &str) -> String {
-    const SLOT: &str = "__obscura_mcp_expression";
-    format!(
-        r#"(function() {{
-            var slot = globalThis.{SLOT} || (globalThis.{SLOT} = {{}});
-            slot.state = 'pending';
-            try {{
-                var value = ({expression});
-                if (value && typeof value.then === 'function') {{
-                    value.then(
-                        function (resolved) {{ slot.state = 'done'; slot.value = resolved; }},
-                        function (rejected) {{ slot.state = 'failed'; slot.error = String(rejected); }}
-                    );
-                    return null;
-                }}
-                slot.state = 'sync';
-                slot.value = value;
-                return null;
-            }} catch (e) {{ slot.state = 'sync'; slot.value = null; slot.error = String(e); return null; }}
-        }})()"#,
-        SLOT = SLOT,
-        expression = expression,
-    )
-}
-/// Resolve a promise that a page expression produced.
-///
-/// `Page::evaluate` is synchronous, so an agent that wrote `await fetch(...)`
-/// or an async IIFE used to get `{}` back and no way to tell that from an empty
-/// object. The expression is evaluated once, and if the result is a thenable its
-/// settlement is polled until it resolves, fails, or the timeout runs out.
-async fn settle_expression_promise(
-    state: &mut BrowserState,
-    expression: &str,
-    timeout: std::time::Duration,
-) -> Option<Value> {
-    let wrapped = expression_wrapper(expression);
-    const SLOT: &str = "__obscura_mcp_expression";
-    let seed = state.page_mut().evaluate(&wrapped);
-    if seed.is_null() && !state.page_mut().has_js() {
-        // No realm: nothing can produce a thenable here.
-        return None;
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    let mut last: Option<Value> = None;
-    loop {
-        let snapshot = state.page_mut().evaluate(&format!(
-            "JSON.stringify((function() {{ var s = globalThis.{SLOT}; return s ? {{state: s.state, value: s.value, error: s.error}} : null; }})())"
-        ));
-        let parsed = snapshot
-            .as_str()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-        if let Some(slot) = parsed {
-            match slot.get("state").and_then(Value::as_str) {
-                Some("pending") => last = slot.get("value").cloned(),
-                Some("sync") => return slot.get("value").cloned(),
-                Some("done") => return slot.get("value").cloned(),
-                Some("failed") => return Some(Value::String(
-                    slot.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string(),
-                )),
-                _ => {}
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Some(Value::String(format!(
-                "{{\"error\":\"the expression did not settle within {} ms\"}}",
-                timeout.as_millis()
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // A promise that settles in a network callback needs the page's own
-        // task queue to turn. Polling evaluate alone leaves it pending forever,
-        // which is how `await fetch(...)` looked like a hang.
-        let _ = state.advance_active_page_tasks().await;
-        let _ = last;
-    }
-}
-
 async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
-    let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000);
-
-    let result = match settle_expression_promise(
-        state,
-        expression,
-        std::time::Duration::from_millis(timeout_ms),
-    )
-    .await
-    {
-        Some(value) => value,
-        // Fall back to the synchronous reading if the promise machinery was
-        // unavailable, so this can only ever return more than before.
-        None => state.page_mut().evaluate(expression),
-    };
+    let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000).max(1);
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    std::time::Instant::now().checked_add(budget).ok_or("timeoutMs is too large")?;
+    let page = state.page_mut();
+    let watchdog = page.js.as_mut().ok_or("Navigate before evaluating JavaScript")?.arm_watchdog(budget);
+    let result = page.evaluate_for_cdp_with_timeout(expression, true, true, timeout_ms).await;
+    // MCP never exposes remote handles. Release results, including exceptions.
+    page.release_object_group();
+    if page.js.as_mut().expect("evaluation runtime").disarm_watchdog(watchdog) {
+        // Termination can prevent the first cleanup; retry under a fresh bounded guard.
+        let cleanup = page.js.as_mut().expect("evaluation runtime").arm_watchdog(budget);
+        page.release_object_group();
+        page.js.as_mut().expect("evaluation runtime").disarm_watchdog(cleanup);
+        return Err(format!("JavaScript evaluation exceeded {timeout_ms}ms"));
+    }
+    let result = result?;
+    if result.thrown {
+        return Err(result.description);
+    }
+    let result = result.value.unwrap_or(Value::Null);
     state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
@@ -1306,9 +1245,7 @@ async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Resul
     let mut attempts: u64 = 0;
     loop {
         attempts += 1;
-        let value = state
-            .page_mut()
-            .evaluate(&format!("JSON.stringify((function(){{ try {{ return (function(){{ return !!({expression}); }})(); }} catch (e) {{ return false; }} }})())"));
+        let value = evaluate_tool_script(state.page_mut(), &format!("JSON.stringify((function(){{ try {{ return (function(){{ return !!({expression}); }})(); }} catch (e) {{ return false; }} }})())"))?;
         let truthy = value
             .as_str()
             .map(|raw| raw == "true")
@@ -1413,7 +1350,7 @@ fn tool_markdown(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
         .unwrap_or(DEFAULT_TEXT_LIMIT);
     let page = state.page_mut();
-    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
+    let result = evaluate_tool_script(page, obscura_browser::HTML_TO_MARKDOWN_JS)?;
     let md = result.as_str().unwrap_or_default();
     Ok(truncate(md, max_chars))
 }
@@ -1444,7 +1381,7 @@ fn tool_links(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         }
         return out;
     })()"#;
-    let val = page.evaluate(js);
+    let val = evaluate_tool_script(page, js)?;
     let arr = val.as_array().cloned().unwrap_or_default();
     let lines: Vec<String> = arr.into_iter()
         .filter(|item| {
@@ -1494,7 +1431,7 @@ fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<S
         }}
         return out;
     }})()"#);
-    let val = page.evaluate(&js);
+    let val = evaluate_tool_script(page, &js)?;
     let arr = val.as_array().cloned().unwrap_or_default();
     let lines: Vec<String> = arr.into_iter().map(|item| {
         let r = item.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1520,6 +1457,7 @@ fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
         .ok_or("Element reference generation exhausted")?;
     let prefix = format!("e{}-", state.ref_generation);
     let page = state.page_mut();
+    if !page.has_js() { return Ok(()); }
     // Never reuse tokens: an old snapshot must not name a different action.
     let tag_js = format!(r#"(function(){{
         var sel = 'a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=checkbox], [role=tab], [role=menuitem], [role=option], [onclick], [tabindex]:not([tabindex="-1"])';
@@ -1532,7 +1470,7 @@ fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
         }}
         return refs;
     }})()"#);
-    let val = page.evaluate(&tag_js);
+    let val = evaluate_tool_script(page, &tag_js)?;
     let refs: Vec<String> = val.as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
@@ -1662,7 +1600,7 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
     // Exponential backoff like browser_wait_for (see comment there).
     let mut tick_ms: u64 = 5;
     loop {
-        let found = state.page_mut().evaluate(&js).as_bool().unwrap_or(false);
+        let found = evaluate_tool_script(state.page_mut(), &js)?.as_bool().unwrap_or(false);
         if found {
             return Ok(format!("Found text {needle:?}"));
         }
@@ -1738,7 +1676,7 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
         }
         return out;
     })()"#;
-    let val = page.evaluate(js);
+    let val = evaluate_tool_script(page, js)?;
     if val.is_null() {
         return Ok("No forms found.".to_string());
     }
@@ -1749,7 +1687,7 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
 /// type='text' (default) sets value, 'check'/'uncheck' toggles checkbox,
 /// 'select' picks an option by value or visible text. Optional
 /// `submit_ref`/`submit_selector` clicks after filling.
-fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let fields = args.get("fields").and_then(Value::as_array)
         .ok_or("Missing fields array")?
         .clone();
@@ -1806,12 +1744,16 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
         };
-        let res = state.page_mut().evaluate(&js);
+        let res = evaluate_tool_script(state.page_mut(), &js)?;
         match res.as_str() {
             Some("ok") => filled += 1,
             Some(e) => errors.push(format!("{selector}: {e}")),
             None => errors.push(format!("{selector}: unknown error")),
         }
+    }
+
+    if !errors.is_empty() {
+        return Err(format!("Filled {filled} fields; not submitted. Errors: {}", errors.join("; ")));
     }
 
     // Optional submit click
@@ -1820,7 +1762,7 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             "ref": args.get("submit_ref"),
             "selector": args.get("submit_selector"),
         });
-        resolve_target(&pseudo, state).ok()
+        Some(resolve_target(&pseudo, state)?)
     } else { None };
     if let Some(sel) = submit_target {
         let js = format!(r#"(function(){{
@@ -1829,15 +1771,15 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             el.click();
             return "ok";
         }})()"#, sel = serde_json::to_string(&sel).unwrap());
-        let _ = state.page_mut().evaluate(&js);
+        let result = evaluate_tool_script(state.page_mut(), &js)?;
+        if result.as_str() != Some("ok") {
+            return Err(format!("Submit target not found: {sel}"));
+        }
         state.interactive_refs.clear();
     }
 
-    if errors.is_empty() {
-        Ok(format!("Filled {filled} fields."))
-    } else {
-        Ok(format!("Filled {filled} fields. Errors: {}", errors.join("; ")))
-    }
+    state.settle_synthetic_navigation().await?;
+    Ok(format!("Filled {filled} fields."))
 }
 
 /// Scroll the page (or an element) by direction + amount, or scroll an
@@ -1856,7 +1798,7 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
             el.scrollIntoView({{behavior:'instant', block:'center'}});
             return JSON.stringify({{x: window.scrollX, y: window.scrollY}});
         }})()"#, sel = serde_json::to_string(&selector).unwrap());
-        let res = state.page_mut().evaluate(&js);
+        let res = evaluate_tool_script(state.page_mut(), &js)?;
         if res.as_str() == Some("error:not found") {
             return Err(format!("Element not found: {selector}"));
         }
@@ -1885,7 +1827,7 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
         dir = serde_json::to_string(direction).unwrap(),
         amt = amt,
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     // A scroll can reveal new DOM (infinite scroll); invalidate refs.
     state.interactive_refs.clear();
     Ok(format!("Scrolled {direction}. {}", res.as_str().unwrap_or("")))
@@ -1905,7 +1847,7 @@ fn tool_get_attribute(args: &Value, state: &mut BrowserState) -> Result<String, 
         sel = serde_json::to_string(&selector).unwrap(),
         a = serde_json::to_string(attr).unwrap(),
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     if res.is_null() {
         return Err(format!("Element not found: {selector}"));
     }
@@ -1919,7 +1861,7 @@ fn tool_count(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         "document.querySelectorAll({sel}).length",
         sel = serde_json::to_string(selector).unwrap()
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     // V8 numbers come back as f64 even when they are integer-valued; as_u64
     // returns None for f64 in serde_json, so coerce via f64.
     let n = res.as_u64()
@@ -1969,7 +1911,7 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
         }}
         return out;
     }})()"#, schema = schema_json);
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
 }
 
@@ -2342,6 +2284,115 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tool_serialization_deadline_recovers_the_page() {
+        // A missing production watchdog must fail this nextest process, not hang CI.
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let backstop = std::thread::spawn(move || {
+            if matches!(stopped.recv_timeout(std::time::Duration::from_secs(10)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                eprintln!("tool serialization exceeded its execution deadline");
+                std::process::exit(1);
+            }
+        });
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Content</p>").await.unwrap();
+        assert_eq!(state.page_mut().evaluate("(function(){globalThis.savedStringify=JSON.stringify;JSON.stringify=function(){while(true){}};return true;})()"), json!(true));
+        let result = tool_extract(&json!({"schema":{"text":"p"}}), &mut state);
+        state.page_mut().evaluate("(function(){JSON.stringify=savedStringify;return true;})()");
+        assert_eq!(state.page_mut().evaluate("6 * 7").as_f64(), Some(42.0), "the terminated page must remain usable");
+        stop.send(()).unwrap();
+        backstop.join().unwrap();
+        assert!(result.is_err(), "serialization overrun must be a tool error");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_failures_are_mcp_tool_errors() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        let mut responses = Vec::new();
+        for expression in [
+            "(function(){throw new Error('agent-fixture');})()",
+            "Promise.reject(new Error('agent-fixture'))",
+            "function (",
+            "new Promise(function(){})",
+        ] {
+            let response = dispatch("tools/call", json!(1), &json!({
+                "name": "browser_evaluate", "arguments": {"expression": expression, "timeoutMs": 30}
+            }), &mut state).await;
+            responses.push((expression, response.result.unwrap()));
+        }
+        for (expression, result) in responses {
+            assert_eq!(result["isError"], json!(true), "failure must not be successful data: {expression}: {result}");
+        }
+        assert_eq!(tool_evaluate(&json!({"expression": "6 * 7"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 42.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_runs_scripts_once_and_preserves_null_results() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        for expression in ["null", "undefined", "Promise.resolve(null)"] {
+            assert_eq!(tool_evaluate(&json!({"expression": expression}), &mut state).await.unwrap(), "null");
+        }
+        assert_eq!(tool_evaluate(&json!({"expression": "var mcpAnswer = 21; mcpAnswer * 2", "timeoutMs": 30}), &mut state).await.unwrap().parse::<f64>().unwrap(), 42.0);
+        state.page_mut().evaluate("globalThis.evaluations = 0");
+        tool_evaluate(&json!({"expression": "globalThis.evaluations++; undefined", "timeoutMs": 30}), &mut state).await.unwrap();
+        assert_eq!(state.page_mut().evaluate("globalThis.evaluations").as_f64(), Some(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interaction_exceptions_are_mcp_tool_errors() {
+        let mut results = Vec::new();
+        for (tool, arguments, setup) in [
+            ("browser_click", json!({"selector":"#action"}), "document.getElementById('action').click = function(){throw new Error('action failed')};"),
+            ("browser_fill", json!({"selector":"#action", "value":"value"}), "globalThis.__obscura_setFieldValue = function(){throw new Error('action failed')};"),
+            ("browser_select_option", json!({"selector":"#action", "value":"a"}), "Object.defineProperty(document.getElementById('action'), 'options', {get:function(){throw new Error('action failed')}});"),
+            ("browser_press_key", json!({"selector":"#action", "key":"Enter"}), "document.getElementById('action').dispatchEvent = function(){throw new Error('action failed')};"),
+            ("browser_scroll", json!({"selector":"#action"}), "document.getElementById('action').scrollIntoView = function(){throw new Error('action failed')};"),
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            state.page_mut().navigate("data:text/html,<button id=action>Continue</button>").await.unwrap();
+            assert_eq!(state.page_mut().evaluate(&format!("(function(){{{setup} return true;}})()")), json!(true));
+            let response = dispatch("tools/call", json!(1), &json!({"name":tool,"arguments":arguments}), &mut state).await;
+            results.push((tool, response.result.unwrap()));
+        }
+        for (tool, result) in results {
+            assert_eq!(result["isError"], json!(true), "throwing action must not report success: {tool}: {result}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_errors_prevent_submission() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=q><button id=go onclick='window.submits++'>Submit</button><script>window.submits=0</script>").await.unwrap();
+        let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[{"selector":"#q","value":"kept"},{"selector":"#missing","value":"bad"}],
+            "submit_selector":"#go"
+        }}), &mut state).await;
+        assert_eq!(state.page_mut().evaluate("window.submits").as_f64(), Some(0.0), "a partial form must not be submitted");
+        assert_eq!(response.result.unwrap()["isError"], json!(true));
+        let response = dispatch("tools/call", json!(2), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[], "submit_ref":"unknown"
+        }}), &mut state).await;
+        assert_eq!(response.result.unwrap()["isError"], json!(true), "a missing submit target must not be ignored");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_submission_reaches_the_server_before_replying() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&base).await.unwrap();
+        assert!(requests.recv_timeout(std::time::Duration::from_secs(2)).unwrap().starts_with("GET /"));
+        let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[{"selector":"#q","value":"complete"}], "submit_selector":"#go"
+        }}), &mut state).await;
+        assert_ne!(response.result.unwrap()["isError"], json!(true));
+        let request = requests.recv_timeout(std::time::Duration::from_secs(1)).expect("submit must complete before the reply");
+        assert!(request.starts_with("POST /submitted"), "{request}");
+        assert!(request.contains("q=complete"), "{request}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn storage_restore_is_origin_scoped_and_works_before_navigation() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (first, _) = spawn_form_recording_server();
@@ -2489,22 +2540,12 @@ mod tests {
         assert_eq!(state.page_mut().evaluate("window.clicked"), json!("target"));
     }
 
-    // The promise wrapper has to work on a page that has never been evaluated
-    // on: the slot is created lazily, so the first synchronous expression must
-    // not throw on an undefined global. This caught a regression where every
-    // browser_evaluate answered "the expression did not settle".
-    #[test]
-    fn expression_promise_wrapper_creates_its_slot_before_writing_to_it() {
-        let wrapped = expression_wrapper("1 + 1");
-        // A wrapper that dereferences the slot before creating it throws on the
-        // first synchronous expression, which surfaced as every
-        // browser_evaluate answering "the expression did not settle".
-        assert!(
-            wrapped.contains("globalThis.__obscura_mcp_expression || (globalThis.__obscura_mcp_expression = {})"),
-            "the slot must be created on demand: {wrapped}"
-        );
-        assert!(wrapped.contains("slot.state = 'sync'"), "sync results must be recorded: {wrapped}");
-        assert!(wrapped.contains("typeof value.then === 'function'"), "thenables must be awaited: {wrapped}");
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_evaluation_and_promise_results_work_without_prior_state() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        assert_eq!(tool_evaluate(&json!({"expression":"1 + 1"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 2.0);
+        assert_eq!(tool_evaluate(&json!({"expression":"Promise.resolve(3)"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 3.0);
     }
 
     // #1015: case-folding can change byte length (Turkish "İ" -> "i̇"), so a
@@ -2911,6 +2952,7 @@ mod tests {
             }),
             &mut state,
         )
+        .await
         .expect("browser_fill_form should succeed");
 
         let actual = state.page_mut().evaluate(
@@ -2983,6 +3025,7 @@ mod tests {
             }),
             &mut state,
         )
+        .await
         .expect("browser_fill_form should succeed");
 
         let actual = state.page_mut().evaluate(
