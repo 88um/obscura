@@ -11,6 +11,7 @@ pub struct BrowserContext {
     /// rather than by a V8 realm, so an entry written in one document is still
     /// there in the next (issue #678).
     pub local_storage: Arc<OriginStorage>,
+    pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -200,6 +201,7 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage,
+            indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -265,6 +267,8 @@ impl BrowserContext {
             } else {
                 Arc::new(OriginStorage::default())
             },
+            indexed_db: if persistent { self.indexed_db.clone() }
+                else { Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()) },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),

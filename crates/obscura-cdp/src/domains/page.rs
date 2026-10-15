@@ -1645,10 +1645,6 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
-        // Obscura does not enforce Content-Security-Policy, so there is
-        // nothing to bypass; acknowledge it like Chrome does. Playwright sends
-        // this for every new page of a context created with bypassCSP: true.
-        "setBypassCSP" => Ok(json!({})),
         // Obscura does not download files to disk, so there is no behavior to
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
