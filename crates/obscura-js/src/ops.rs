@@ -1350,12 +1350,12 @@ fn render_mutation_impact(
             let Some((name, value)) = arg2.split_once('\0') else {
                 return RenderMutationImpact::default();
             };
-            let old = dom
-                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute(name) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "set_attribute_ns" => {
@@ -1370,14 +1370,12 @@ fn render_mutation_impact(
                 .split_once(':')
                 .map(|(_, local)| local)
                 .unwrap_or(qualified);
-            let old = dom
-                .with_node(target, |node| {
-                    node.get_attribute_ns(namespace, local).map(str::to_owned)
-                })
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute_ns(namespace, local) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "remove_attribute" => {
@@ -1411,12 +1409,13 @@ fn render_mutation_impact(
             let (Some(parent), Some(child)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+            let (Some(()), Some(old_parent)) =
+                (dom.with_node(parent, |_| ()), dom.with_node(child, |node| node.parent))
+            else {
                 return RenderMutationImpact::default();
-            }
-            let old_parent = dom.get_node(child).and_then(|node| node.parent);
-            let already_last =
-                old_parent == Some(parent) && dom.children(parent).last().copied() == Some(child);
+            };
+            let already_last = old_parent == Some(parent)
+                && dom.with_node(parent, |node| node.last_child) == Some(Some(child));
             RenderMutationImpact {
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
@@ -1430,23 +1429,23 @@ fn render_mutation_impact(
             };
             RenderMutationImpact {
                 connected: node_is_connected(dom, child),
-                actual_change: dom.get_node(child).and_then(|node| node.parent).is_some(),
+                actual_change: dom.with_node(child, |node| node.parent.is_some()).unwrap_or(false),
             }
         }
         "insert_before" => {
             let (Some(new_node), Some(reference)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(new_node).is_none() {
+            if dom.with_node(new_node, |_| ()).is_none() {
                 return RenderMutationImpact::default();
             }
-            let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+            let Some((Some(reference_parent), reference_prev)) =
+                dom.with_node(reference, |node| (node.parent, node.prev_sibling))
             else {
                 return RenderMutationImpact::default();
             };
             let new_was_connected = node_is_connected(dom, new_node);
-            let already_immediately_before =
-                dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+            let already_immediately_before = reference_prev == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
                 actual_change: new_node != reference && (!already_immediately_before
@@ -1461,7 +1460,7 @@ fn render_mutation_impact(
                 connected: node_is_connected(dom, target),
                 // Parsing normalizes source text, so a cheap string comparison
                 // cannot prove equality. Connected replacement remains dirty.
-                actual_change: dom.get_node(target).is_some(),
+                actual_change: dom.with_node(target, |_| ()).is_some(),
             }
         }
         "set_text_content" => {
@@ -1566,8 +1565,8 @@ fn retained_style_mutation(
         }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
-            dom.get_node(node)?;
-            let old_parent = dom.get_node(child)?.parent;
+            dom.with_node(node, |_| ())?;
+            let old_parent = dom.with_node(child, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node: child,
@@ -1578,16 +1577,16 @@ fn retained_style_mutation(
             )
         }
         "remove_child" => {
-            let old_parent = dom.get_node(node)?.parent?;
+            let old_parent = dom.with_node(node, |node| node.parent)??;
             Some(obscura_render::TreeStyleMutation::Remove { node, old_parent }.into())
         }
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
-            let new_parent = dom.get_node(reference)?.parent?;
+            let new_parent = dom.with_node(reference, |node| node.parent)??;
             if dom.containing_shadow_root(new_parent).is_some() {
                 return None;
             }
-            let old_parent = dom.get_node(node)?.parent;
+            let old_parent = dom.with_node(node, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node,
@@ -1597,18 +1596,20 @@ fn retained_style_mutation(
                 .into(),
             )
         }
-        "set_text_content" => match &dom.get_node(node)?.data {
-            NodeData::Text { .. } => Some(
+        "set_text_content" => match dom
+            .with_node(node, |node| matches!(node.data, NodeData::Text { .. }).then_some(node.parent))?
+        {
+            Some(parent) => Some(
                 obscura_render::TreeStyleMutation::Text {
                     node,
-                    parent: dom.get_node(node)?.parent,
+                    parent,
                 }
                 .into(),
             ),
             // Element/fragment textContent replaces a child list. That can
             // flip :empty and structural/relational selectors, so the local
             // text fast path cannot describe the mutation safely.
-            _ => None,
+            None => None,
         },
         _ => None,
     }
@@ -2214,21 +2215,6 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             .as_ref()
             .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
             .unwrap_or_default();
-        #[cfg(feature = "render")]
-        let keep_inline_style_values = state.prepared_render.is_some();
-        #[cfg(feature = "render")]
-        let retained_style_mutation = state
-            .dom
-            .as_ref()
-            .and_then(|dom| {
-                retained_style_mutation(
-                    dom,
-                    &cmd,
-                    &arg1,
-                    &arg2,
-                    keep_inline_style_values,
-                )
-            });
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
@@ -2240,6 +2226,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // state is deliberately excluded because `:checked` can affect style.
         let invalidate_geometry =
             invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        #[cfg(feature = "render")]
+        let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
+            state.dom.as_ref().and_then(|dom| {
+                retained_style_mutation(dom, &cmd, &arg1, &arg2, true)
+            })
+        } else {
+            None
+        };
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
             state
@@ -2290,12 +2284,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|reference| state.dom.as_ref()?.get_node(reference)?.parent),
+                    .and_then(|reference| state.dom.as_ref()?.with_node(reference, |node| node.parent).flatten()),
                 "remove_child" => arg1
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|child| state.dom.as_ref()?.get_node(child)?.parent),
+                    .and_then(|child| state.dom.as_ref()?.with_node(child, |node| node.parent).flatten()),
                 "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
                     arg1.parse::<u32>().ok().map(NodeId::new)
                 }
