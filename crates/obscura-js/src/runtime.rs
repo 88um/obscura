@@ -23083,6 +23083,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn failed_module_transport_records_one_failure_without_a_response_body() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).unwrap();
+            // Close before sending headers, rather than returning an HTTP error.
+        });
+        let url = format!("http://{address}/entry.js");
+        let client = obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("http://{address}/"));
+        rt.set_http_client(std::sync::Arc::new(client));
+        let error = rt.load_module(&url, 1_000).await.unwrap_err();
+        assert!(error.contains("Failed to fetch module"), "{error}");
+        server.join().unwrap();
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "failed module request must remain observable");
+        let event = &events[0];
+        assert_eq!(event.url, url);
+        assert_eq!(event.resource_type, "Script");
+        assert_eq!(event.status, 0);
+        assert_eq!(event.error_text.as_deref(), Some("net::ERR_FAILED"));
+        assert!(rt.get_network_response_body(&event.request_id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_module_transport_records_one_failure() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = format!("http://{address}/entry.js");
+        let client = obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("http://{address}/"));
+        rt.set_http_client(std::sync::Arc::new(client));
+        let error = rt.load_module(&url, 100).await.unwrap_err();
+        server.abort();
+        assert!(error.contains("timed out"), "{error}");
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "timed-out graph must not disappear from Network");
+        assert_eq!(events[0].url, url);
+        assert_eq!(events[0].error_text.as_deref(), Some("net::ERR_FAILED"));
+        assert!(rt.get_network_response_body(&events[0].request_id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn entry_module_http_failure_is_not_evaluated_as_empty_source() {
         let base = spawn_one_response_server("404 Not Found", "not found");
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
