@@ -13493,6 +13493,34 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn same_parent_moves_keep_geometry_and_observer_records_consistent() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:0}#parent{display:flex}.item{flex:0 0 40px;height:20px}</style>\
+             <div id=parent><div id=a class=item></div><div id=b class=item></div></div>",
+        );
+        rt.evaluate("document.getElementById('b').getBoundingClientRect().x").unwrap();
+        assert!(rt.state.borrow().prepared_render.is_some());
+        let records = rt.evaluate(
+            "(function(){ const parent=document.getElementById('parent'), b=document.getElementById('b'); \
+             globalThis.moveObserver=new MutationObserver(()=>{}); moveObserver.observe(parent,{childList:true}); \
+             parent.appendChild(b); return moveObserver.takeRecords().map(record=>[record.type, \
+               record.removedNodes[0]?.id || null, record.addedNodes[0]?.id || null]); })()"
+        ).unwrap();
+        assert_eq!(records, serde_json::json!([
+            ["childList", "b", null], ["childList", null, "b"],
+        ]));
+        assert!(rt.state.borrow().prepared_render.is_some(), "a last-child move must retain geometry");
+        let moved = rt.evaluate(
+            "(function(){ const parent=document.getElementById('parent'), a=document.getElementById('a'), \
+             b=document.getElementById('b'); parent.appendChild(a); const records=moveObserver.takeRecords(); \
+             moveObserver.disconnect(); return [a.getBoundingClientRect().x, b.getBoundingClientRect().x, \
+               records.length, records[0].removedNodes[0]===a, records[1].addedNodes[0]===a]; })()"
+        ).unwrap();
+        assert_eq!(moved, serde_json::json!([40, 0, 2, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn waapi_pause_seek_and_cancel_preserve_authored_inline_style() {
         let mut rt = setup_runtime(
             r#"<html><body><div id="box" style="opacity:.2;width:20px;height:20px"></div></body></html>"#,
