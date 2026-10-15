@@ -2566,6 +2566,16 @@ impl Stylesheet {
             .is_some_and(|evaluator| evaluator.condition_matches(self, subject, id, kind))
     }
 
+    pub(crate) fn animation_affects_non_geometric_style(&self, name: &str) -> bool {
+        // Only tracks exposed by the partial CSSOM snapshot require live sampling.
+        self.keyframes.get(name).is_some_and(|keyframes| {
+            keyframes.tracks.keys().any(|property| matches!(property,
+                AnimatedProperty::Opacity | AnimatedProperty::Color
+                    | AnimatedProperty::BackgroundColor | AnimatedProperty::Visibility
+            ))
+        })
+    }
+
     pub(crate) fn has_container_queries(&self) -> bool {
         self.rules
             .iter()
