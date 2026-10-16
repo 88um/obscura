@@ -66,10 +66,22 @@ Navigation and lifecycle:
 
 Read the page:
 
-- `browser_snapshot`: current URL, title, readable body text, and interactive
-  element references. Optional `max_chars` limits the returned text.
+- `browser_snapshot`: current URL, title, actionable element references, control
+  states, and visible body text. References can be passed directly to interaction
+  tools without a separate listing call. Names use the same native accessibility
+  logic as CDP, including associated labels and ARIA name precedence.
+  `max_chars` defaults to 4000 and is shared by whole control descriptions first,
+  then body text. Omission markers are added outside that budget. URL and title
+  are separately capped at 256 characters each; `max_chars: 0` returns only that
+  metadata. Descriptions preview at most 80 characters per name or value and
+  do not include password control values.
 - `browser_markdown`, `browser_links`, `browser_extract`: page as markdown, link list, or structured content.
 - `browser_interactive_elements`, `browser_detect_forms`: actionable elements and form fields.
+
+Snapshots and interactive-element listings exclude HTML/ARIA-hidden content;
+render builds also apply computed CSS visibility. Hidden text explicitly
+referenced by a visible control can still supply its accessible name. These are
+compact browsing context, not a claim of complete accessibility conformance.
 - `browser_get_attribute`, `browser_count`, `browser_search`: read an attribute, count matches, find text.
 
 Interact:

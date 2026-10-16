@@ -372,11 +372,11 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_snapshot",
-                "description": "Get the current page content as text (title, URL, and readable body text)",
+                "description": "Get URL, title, actionable element references, control states, and visible body text",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "number", "minimum": 0, "description": "Truncate readable body text to this many characters (default: 4000)" }
+                        "max_chars": { "type": "number", "minimum": 0, "description": "Character budget shared by whole control descriptions and visible body text (default: 4000); URL and title are separately capped at 256 characters each" }
                     },
                     "additionalProperties": false
                 }
@@ -1037,28 +1037,35 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
         .unwrap_or(DEFAULT_TEXT_LIMIT);
     rebuild_interactive_refs(state)?;
     let page = state.page_mut();
-    let url = page.url_string();
-    let title = page.title.clone();
-
+    let url = truncate(&page.url_string(), 256);
+    let title = truncate(&page.title, 256);
+    if max_chars == 0 { return Ok(format!("URL: {url}\nTitle: {title}")); }
+    let context = accessibility_context(page);
     let body_text = page.with_dom(|dom| {
         if let Ok(Some(body)) = dom.query_selector("body") {
-            extract_text(dom, body)
+            extract_text(dom, body, context.as_ref())
         } else {
             String::new()
         }
     }).unwrap_or_default();
 
-    let refs_summary = if state.interactive_refs.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n{} interactive element(s) registered. Call browser_interactive_elements to list, or pass `ref` to browser_click/browser_fill/browser_type.",
-            state.interactive_refs.len(),
-        )
-    };
-
-    let body = truncate(body_text.trim(), max_chars);
-    Ok(format!("URL: {url}\nTitle: {title}\n\n{body}{refs_summary}"))
+    let lines = context.as_ref().map(|context| interactive_lines(state, context, usize::MAX)).unwrap_or_default();
+    let mut content = String::new();
+    let mut remaining = max_chars;
+    let mut shown = 0;
+    for line in &lines {
+        let cost = line.chars().count() + 1;
+        if cost > remaining { break; }
+        content.push_str(line);
+        content.push('\n');
+        remaining -= cost;
+        shown += 1;
+    }
+    if shown < lines.len() {
+        content.push_str(&format!("...({} controls omitted; use browser_interactive_elements)\n", lines.len() - shown));
+    }
+    content.push_str(&truncate(body_text.trim(), remaining));
+    Ok(format!("URL: {url}\nTitle: {title}\n\n{content}"))
 }
 
 async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -1408,43 +1415,49 @@ fn tool_links(args: &Value, state: &mut BrowserState) -> Result<String, String> 
 fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
     rebuild_interactive_refs(state)?;
-    if state.interactive_refs.is_empty() {
+    let context = accessibility_context(state.page_mut());
+    let lines = context.as_ref().map(|context| interactive_lines(state, context, limit)).unwrap_or_default();
+    if lines.is_empty() {
         return Ok("No interactive elements on this page.".to_string());
     }
-    let page = state.page_mut();
-    let js = format!(r#"(function(){{
-        var els = document.querySelectorAll('[data-obscura-ref]');
-        var out = [];
-        for (var i = 0; i < els.length && out.length < {limit}; i++) {{
-            var e = els[i];
-            var label = (e.innerText || e.textContent || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('value') || e.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-            var role = e.getAttribute('role') || '';
-            var typeAttr = e.getAttribute('type') || '';
-            out.push({{
-                ref: e.getAttribute('data-obscura-ref'),
-                tag: e.tagName.toLowerCase(),
-                type: typeAttr,
-                role: role,
-                name: e.getAttribute('name') || '',
-                label: label,
-            }});
-        }}
-        return out;
-    }})()"#);
-    let val = evaluate_tool_script(page, &js)?;
-    let arr = val.as_array().cloned().unwrap_or_default();
-    let lines: Vec<String> = arr.into_iter().map(|item| {
-        let r = item.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
-        let tag = item.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
-        let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let label = item.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = if !ty.is_empty() { format!("{tag}[{ty}]") } else if !role.is_empty() { format!("{tag}[role={role}]") } else { tag.to_string() };
-        let detail = if !name.is_empty() { format!(" name={name:?}") } else { String::new() };
-        format!("ref={r:<5} {kind:<22} {label:?}{detail}")
-    }).collect();
     Ok(lines.join("\n"))
+}
+
+fn accessibility_context(page: &Page) -> Option<obscura_browser::accessibility::AccessibilityContext> {
+    #[cfg(feature = "render")]
+    let styles = page.js.as_ref().map(|js| js.accessibility_styles()).unwrap_or_default();
+    #[cfg(not(feature = "render"))]
+    let styles = HashMap::new();
+    page.with_dom(|dom| obscura_browser::accessibility::AccessibilityContext::for_document(dom, &styles))
+}
+
+fn interactive_lines(state: &BrowserState, context: &obscura_browser::accessibility::AccessibilityContext, limit: usize) -> Vec<String> {
+    let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) else { return Vec::new(); };
+    let refs: HashMap<_, _> = state.interactive_refs.iter().map(|(reference, id)| (id.raw(), reference.as_str())).collect();
+    page.with_dom(|dom| dom.descendants(dom.document()).into_iter().filter_map(|id| {
+        let reference = refs.get(&id.raw())?;
+        let ax = context.describe_node(dom, id)?;
+        let node = dom.get_node(id)?;
+        let tag = node.as_element()?.local.as_ref();
+        let preview = |value: &str| value.chars().take(80).collect::<String>();
+        let label = ax["name"]["value"].as_str().map(str::to_owned)
+            .unwrap_or_else(|| extract_text(dom, id, Some(context)).trim().to_string());
+        let label = preview(&label);
+        let role = ax["role"]["value"].as_str().unwrap_or("generic");
+        let mut line = format!("ref={reference} {tag} {label:?} role={role}");
+        if let Some(kind) = node.get_attribute("type") { line.push_str(&format!(" type={:?}", preview(kind))); }
+        if let Some(name) = node.get_attribute("name") { line.push_str(&format!(" name={:?}", preview(name))); }
+        if let Some(value) = ax["value"]["value"].as_str() { line.push_str(&format!(" value={:?}", preview(value))); }
+        if let Some(properties) = ax["properties"].as_array() {
+            for property in properties {
+                let name = property["name"].as_str().unwrap_or("");
+                if matches!(name, "checked" | "disabled" | "required" | "expanded" | "selected" | "pressed") {
+                    line.push_str(&format!(" {name}={}", property["value"]["value"]));
+                }
+            }
+        }
+        Some(line)
+    }).take(limit).collect()).unwrap_or_default()
 }
 
 /// Rebuild the ref table: walk the DOM, find every interactable, assign
@@ -1999,7 +2012,7 @@ fn append_text_segment(result: &mut String, pending_space: &mut bool, contents: 
     *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
 }
 
-fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
+fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId, context: Option<&obscura_browser::accessibility::AccessibilityContext>) -> String {
     use obscura_dom::NodeData;
 
     enum Work {
@@ -2036,11 +2049,13 @@ fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> Str
 
         match &node.data {
             NodeData::Text { contents } => {
-                append_text_segment(&mut result, &mut pending_space, contents);
+                if context.is_none_or(|context| !context.is_hidden(id)) {
+                    append_text_segment(&mut result, &mut pending_space, contents);
+                }
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
-                if matches!(tag, "script" | "style" | "noscript") {
+                if matches!(tag, "script" | "style" | "noscript" | "template") {
                     continue;
                 }
 
@@ -2087,7 +2102,7 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
     let page = state.page_mut();
     let body = page.with_dom(|dom| {
         dom.query_selector("body").ok().flatten()
-            .map(|b| extract_text(dom, b))
+            .map(|b| extract_text(dom, b, None))
             .unwrap_or_default()
     }).unwrap_or_default();
 
@@ -2282,6 +2297,82 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_references_are_actionable_without_an_extra_listing() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<label for=q>Work email</label><input id=q><button aria-label='Save account' onclick='window.saved=true'>Unhelpful text</button>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let action = snapshot.lines().find(|line| line.starts_with("ref=") && line.contains("Save account"))
+            .expect("snapshot must include an accessible name and usable reference");
+        let reference = action.split_whitespace().next().unwrap().strip_prefix("ref=").unwrap();
+        let reference = reference.to_string();
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Work email")), "associated labels must name fields: {snapshot}");
+        tool_click(&json!({"ref":reference}), &mut state).await.unwrap();
+        assert_eq!(state.page_mut().evaluate("window.saved"), json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_exposes_live_states_without_password_values() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=c type=checkbox checked aria-label=Consent><input id=f value=old aria-label=Account><input id=p type=password aria-label=Password><button disabled>Blocked</button><div role=tab aria-selected=true>Overview</div><button aria-expanded=false>Details</button>").await.unwrap();
+        state.page_mut().evaluate("(function(){document.getElementById('c').checked=false;document.getElementById('f').value='fresh';document.getElementById('p').value='private-password';return true;})()");
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        for (label, detail) in [("Consent", "checked=false"), ("Account", "value=\"fresh\""), ("Blocked", "disabled=true"), ("Overview", "selected=true"), ("Details", "expanded=false")] {
+            assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains(label) && line.contains(detail)), "missing {label} {detail}: {snapshot}");
+        }
+        assert!(!snapshot.contains("private-password"), "automatic snapshots must not echo password values");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_budget_bounds_metadata_and_never_splits_a_reference() {
+        let mut state = BrowserState::new(None, None, false);
+        let html = format!("<title>{}</title><button>Continue</button><p>{}</p>", "界".repeat(1000), "Body ".repeat(2000));
+        state.page_mut().navigate(&format!("data:text/html,{html}")).await.unwrap();
+        let snapshot = tool_snapshot(&json!({"max_chars":96}), &mut state).unwrap();
+        assert!(snapshot.chars().count() < 900, "metadata must not bypass the content budget: {} characters", snapshot.chars().count());
+        for line in snapshot.lines().filter(|line| line.starts_with("ref=")) {
+            let reference = line.split_whitespace().next().unwrap().strip_prefix("ref=").unwrap();
+            assert!(state.interactive_refs.contains_key(reference), "a truncated ref must never be advertised");
+            assert!(line.contains("Continue"), "whole descriptions must fit or be omitted");
+        }
+        assert!(snapshot.contains("truncated") || snapshot.contains("omitted"), "omission must be explicit");
+        let empty = tool_snapshot(&json!({"max_chars":0}), &mut state).unwrap();
+        assert!(!empty.lines().any(|line| line.starts_with("ref=")));
+        assert!(empty.chars().count() < 800);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_omits_hidden_content_and_controls() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Visible</p><div hidden><button>Hidden action</button><p>Hidden body</p></div><div aria-hidden=true>Private panel</div>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let content = snapshot.split_once("\n\n").unwrap().1;
+        for hidden in ["Hidden action", "Hidden body", "Private panel"] {
+            assert!(!content.contains(hidden), "hidden content must not be exposed as visible context: {content}");
+        }
+        assert!(content.contains("Visible"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshots_preserve_generic_interactive_text_and_hidden_referenced_names() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<div tabindex=0 onclick='window.opened=true'>Open <b>folder</b></div><span id=label hidden>Accessible details</span><button aria-labelledby=label>Other text</button>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Open folder")), "unlabelled generic controls must keep their visible text: {snapshot}");
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Accessible details")), "hidden referenced text still supplies the visible control's name: {snapshot}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshots_apply_css_visibility_without_hiding_visible_overrides() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<style>.gone{display:none}.invisible{visibility:hidden}.shown{visibility:visible}</style><div class=gone><button>CSS hidden action</button></div><div class=invisible>Hidden text<button class=shown>Visible override</button></div>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let content = snapshot.split_once("\n\n").unwrap().1;
+        assert!(!content.contains("CSS hidden action") && !content.contains("Hidden text"), "{content}");
+        assert!(content.lines().any(|line| line.starts_with("ref=") && line.contains("Visible override")), "a visible descendant must remain actionable: {content}");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn tool_serialization_deadline_recovers_the_page() {

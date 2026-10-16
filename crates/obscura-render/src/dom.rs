@@ -4575,26 +4575,36 @@ impl NonGeometricStyleCache {
     ) -> Option<Self> {
         let sources = document_stylesheet_sources(tree, viewport, media_type);
         let sheet = cache.get(&sources, viewport, media_type)?;
+        Some(Self::from_sheet(tree, viewport, sheet))
+    }
+
+    fn from_sheet(tree: &DomTree, viewport: (f32, f32), sheet: std::sync::Arc<crate::css::Stylesheet>) -> Self {
         let quirks = !tree.children(tree.document()).iter().any(|node| {
             tree.borrow_node(*node).is_some_and(|node| {
                 matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
             })
         });
-        Some(Self {
+        Self {
             has_container_queries: sheet.has_container_queries(), sheet, viewport, quirks,
             styles: HashMap::new(), custom_properties: HashMap::new(), ancestors: HashMap::new(),
             path: Vec::new(),
-        })
+        }
     }
 
     pub fn resolve(
         &mut self, tree: &DomTree, id: NodeId, property: &str,
     ) -> Option<HashMap<&'static str, String>> {
+        self.resolve_style(tree, id, property).map(crate::paint::non_geometric_computed_style)
+    }
+
+    fn resolve_style(
+        &mut self, tree: &DomTree, id: NodeId, property: &str,
+    ) -> Option<&crate::LayoutStyle> {
         if !Self::supports(property) || !tree.is_connected(id) {
             return None;
         }
         if self.ancestors.contains_key(&id) {
-            return Some(crate::paint::non_geometric_computed_style(self.styles.get(&id)?));
+            return self.styles.get(&id);
         }
         let mut path = tree.ancestors(id);
         path.reverse();
@@ -4690,8 +4700,37 @@ impl NonGeometricStyleCache {
             }
             self.ancestors.insert(node, (cell_padding, dark, ancestor_display_none, parent_is_item_container));
         }
-        Some(crate::paint::non_geometric_computed_style(self.styles.get(&id)?))
+        self.styles.get(&id)
     }
+}
+
+/// Read display/visibility without retaining geometry or styles for completed branches.
+/// Unsupported cascade dependencies leave the full renderer as the authority.
+#[cfg(feature = "paint")]
+pub fn accessibility_styles_without_layout(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+    cache: &crate::css::StylesheetCache,
+) -> Option<HashMap<NodeId, (bool, Option<bool>)>> {
+    let sources = document_stylesheet_sources(tree, viewport, media_type);
+    // This document-wide read checks every animation owner before returning.
+    // Keep ordinary CSSOM cold-read behavior and retained-layout keys unchanged.
+    let sheet = cache.get(&sources, viewport, media_type).unwrap_or_else(|| std::sync::Arc::new(
+        crate::css::Stylesheet::parse_for_viewport_and_media(tree, &sources, viewport, media_type),
+    ));
+    let mut cascade = NonGeometricStyleCache::from_sheet(tree, viewport, sheet);
+    let mut result = HashMap::new();
+    for id in tree.descendants(tree.document()) {
+        if !tree.with_node(id, |node| node.is_element()).unwrap_or(false) { continue; }
+        let style = cascade.resolve_style(tree, id, "visibility")?;
+        if style.animation_name.is_some() { return None; }
+        result.insert(id, (style.display == crate::Display::None, style.visibility_hidden));
+        let path = &cascade.path;
+        cascade.styles.retain(|id, _| path.contains(id));
+        cascade.ancestors.retain(|id, _| path.contains(id));
+    }
+    Some(result)
 }
 
 fn document_stylesheet_sources(
@@ -15546,6 +15585,33 @@ mod tests {
     use super::*;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn accessibility_style_reads_preserve_visibility_and_the_retained_cache_key() {
+        let tree = parse_html("<!doctype html><style>body{--conceal:hidden}.hidden{visibility:var(--conceal)}.shown{visibility:visible}.gone{display:none}</style><div class=hidden id=hidden><span class=shown id=shown>shown</span></div><div class=gone id=gone>gone</div>");
+        let sheets = crate::StylesheetCache::default();
+        let styles = accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &sheets).unwrap();
+        assert_eq!(styles[&tree.get_element_by_id("hidden").unwrap()].1, Some(true));
+        assert_eq!(styles[&tree.get_element_by_id("shown").unwrap()].1, Some(false));
+        assert!(styles[&tree.get_element_by_id("gone").unwrap()].0);
+        assert_eq!(sheets.retained_source_bytes(), 0, "a read must not bless an unrelated retained layout with a new stylesheet key");
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn accessibility_styles_decline_animations_containers_and_shadow_dependencies() {
+        for source in [
+            "<!doctype html><style>@keyframes move{to{transform:translateX(1px)}}#x{animation:move 1s infinite}</style><p id=x>animated</p>",
+            "<!doctype html><style>.c{container-type:inline-size}@container(min-width:1px){#x{visibility:hidden}}</style><div class=c><p id=x>query</p></div>",
+        ] {
+            let tree = parse_html(source);
+            assert!(accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &crate::StylesheetCache::default()).is_none(), "unsupported dependencies must use full preparation: {source}");
+        }
+        let tree = parse_html("<!doctype html><div id=host></div><section id=source><style>:host{display:none}</style></section>");
+        attach_programmatic_shadow(&tree, tree.get_element_by_id("host").unwrap(), tree.get_element_by_id("source").unwrap());
+        assert!(accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &crate::StylesheetCache::default()).is_none());
+    }
 
     fn attach_programmatic_shadow(tree: &DomTree, host: NodeId, source: NodeId) -> NodeId {
         let root = tree
