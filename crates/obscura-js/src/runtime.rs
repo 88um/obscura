@@ -1013,6 +1013,11 @@ impl ObscuraJsRuntime {
         self.realm_states().borrow_mut().forget_frame(frame_id);
     }
 
+    /// Pending initial realms can already own children before Page adopts them.
+    pub fn frame_is_active(&self, frame_id: u32) -> bool {
+        self.realm_states().borrow().frame_timers_active(frame_id) != Some(false)
+    }
+
     /// The origin of the document this runtime is running, or `"null"` for a
     /// scheme that has no tuple origin.
     pub(crate) fn page_origin(&self) -> String {
