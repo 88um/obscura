@@ -4173,6 +4173,17 @@ impl ObscuraJsRuntime {
     pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
         let mut state = self.state.borrow_mut();
         crate::ops::sample_live_document_animations(&mut state);
+        if state.animation_timeline.waapi_nodes().is_empty() {
+            if let Some(styles) = state.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::accessibility_styles_without_layout(
+                    dom, state.viewport, state.render_media, &state.stylesheet_cache,
+                )
+            }) {
+                return styles.into_iter().map(|(id, (display_none, visibility_hidden))| {
+                    (id, AccessibilityStyle { display_none, visibility_hidden })
+                }).collect();
+            }
+        }
         let Some(prepared) = crate::ops::ensure_prepared_render(&mut state) else {
             return HashMap::new();
         };
@@ -4711,6 +4722,18 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn static_accessibility_visibility_does_not_allocate_geometry() {
+        let rt = setup_runtime("<!doctype html><style>.gone{display:none}.hidden{visibility:hidden}.shown{visibility:visible}</style><div class=gone id=gone>hidden</div><div class=hidden id=hidden><span class=shown id=shown>visible</span></div>");
+        let styles = rt.accessibility_styles();
+        let ids = rt.with_dom(|dom| ["gone", "hidden", "shown"].map(|id| dom.get_element_by_id(id).unwrap())).unwrap();
+        assert!(styles[&ids[0]].display_none);
+        assert_eq!(styles[&ids[1]].visibility_hidden, Some(true));
+        assert_eq!(styles[&ids[2]].visibility_hidden, Some(false));
+        assert!(rt.state.borrow().prepared_render.is_none(), "a static visibility read must not retain layout/text geometry for an entire document");
     }
 
     #[test]
