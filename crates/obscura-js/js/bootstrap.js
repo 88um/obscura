@@ -2760,6 +2760,13 @@ function _replaceAllChildren(parent, node, method) {
   }
 }
 
+const _attributePositionOrder = new WeakMap();
+let _nextAttributePositionOrder = 0;
+function _attributePositionKey(node) {
+  if (!_attributePositionOrder.has(node)) _attributePositionOrder.set(node, ++_nextAttributePositionOrder);
+  return _attributePositionOrder.get(node);
+}
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -2786,6 +2793,15 @@ class Node {
   get ownerDocument() { return _nodeDocumentOf(this); }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
+    if (_foreignDocumentCount) {
+      const doc = this.nodeType === 9 ? this : this.ownerDocument;
+      if (doc && doc !== globalThis.document) {
+        const url = doc.URL || "about:blank";
+        const base = doc.querySelector('base[href]');
+        try { return base ? new URL(base.getAttribute('href'), url).href : url; }
+        catch (e) { return url; }
+      }
+    }
     try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
@@ -2899,6 +2915,17 @@ class Node {
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
+    if (t === 9) {
+      const xml = this instanceof XMLDocument || (this._documentShim && _isXMLDocument(this));
+      const clone = _createDetachedDocument(this.contentType, !!xml);
+      clone._documentURL = this.URL;
+      clone._documentEncoding = this.characterSet;
+      clone._documentCompatMode = this.compatMode;
+      if (deep) {
+        for (const child of this.childNodes) clone.appendChild(child.cloneNode(true));
+      }
+      return clone;
+    }
     if (t === 1) {
       return _wrap(+_dom("clone_node", this._nid, deep ? "true" : "false"));
     }
@@ -2937,6 +2964,25 @@ class Node {
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
+    if (this === other) return 0;
+    if (this.nodeType === 2 || other.nodeType === 2) {
+      const ownAttr = this.nodeType === 2, otherAttr = other.nodeType === 2;
+      const own = ownAttr ? this.ownerElement : this;
+      const target = otherAttr ? other.ownerElement : other;
+      if (!own || !target) {
+        return 33 | (_attributePositionKey(this) < _attributePositionKey(other) ? 4 : 2);
+      }
+      if (own === target) {
+        if (ownAttr && otherAttr) {
+          const names = own.getAttributeNames();
+          const a = names.indexOf(this.name), b = names.indexOf(other.name);
+          return a === b ? 0 : 32 | (a < b ? 4 : 2);
+        }
+        return ownAttr ? 10 : 20;
+      }
+      const order = own.compareDocumentPosition(target);
+      return order & ~(ownAttr ? 16 : 0) & ~(otherAttr ? 8 : 0);
+    }
     if (this._nid === other._nid) return 0;
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
@@ -3590,9 +3636,9 @@ class NamedNodeMap {
     return _domParse("attribute_names", this._element._nid) || [];
   }
   _attr(name) {
-    const value = this._element.getAttribute(name);
-    if (value === null) return null;
-    const attr = new Attr(name, value, null, null);
+    const info = _domParse("attribute_metadata", this._element._nid, name);
+    if (!info) return null;
+    const attr = new Attr(info.name, info.value, info.namespaceURI, info.prefix);
     attr.ownerElement = this._element;
     return attr;
   }
@@ -3606,7 +3652,13 @@ class NamedNodeMap {
     return this._names().includes(name) ? this._attr(name) : null;
   }
   getNamedItemNS(namespaceURI, localName) {
-    return this.getNamedItem(localName);
+    const ns = namespaceURI == null || namespaceURI === '' ? null : String(namespaceURI);
+    const local = String(localName);
+    for (const name of this._names()) {
+      const attr = this._attr(name);
+      if (attr && attr.namespaceURI === ns && attr.localName === local) return attr;
+    }
+    return null;
   }
   setNamedItem(attr) {
     if (!attr || typeof attr.name !== "string") return null;
@@ -6157,7 +6209,7 @@ class Document extends Node {
     title.textContent = value;
   }
   get URL() {
-    if (this._detached) return "about:blank";
+    if (this._detached) return this._documentURL || "about:blank";
     const get = _documentRealmMember(this, 'URL');
     return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
   }
@@ -6199,6 +6251,7 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() {
+    if (this._detached) return this._documentCompatMode || "CSS1Compat";
     const get = _documentRealmMember(this, 'compatMode');
     return get ? Reflect.apply(get, this, [])
       : (this._nid == null ? "CSS1Compat" : _dom("document_compat_mode"));
@@ -6207,7 +6260,8 @@ class Document extends Node {
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
-  get characterSet() { return (this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding(); }
+  get characterSet() { return this._documentEncoding || ((this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding()); }
+  get [Symbol.toStringTag]() { return this instanceof XMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -12111,9 +12165,7 @@ const _checkXmlWellFormed = (html) => {
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
 // then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
 // feature-detect writes `<form></form>` and wiped real bodies). We parse the
-// input into a detached `<html>` element and wrap it so the common Document
-// API surface (body / head / documentElement / querySelector* / getElementById /
-// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
+// HTML uses an inert document parse; XML retains the limited HTML-backed shim.
 // Conservative XML well-formedness check. obscura has no XML parser, so this
 // only decides whether to surface a <parsererror> (it does not build an XML
 // tree). It flags clear structural errors — mismatched or unclosed tags,
@@ -12172,7 +12224,14 @@ const _escapeXmlErrorText = (text) =>
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
+    const parserURL = document.URL;
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
+    if (!isXml) {
+      const doc = _createDetachedDocument("text/html", false);
+      doc._documentURL = parserURL;
+      doc._documentCompatMode = _dom("parse_html_document", doc._nid, html);
+      return doc;
+    }
     const root = document.createElement("html");
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
@@ -12255,14 +12314,13 @@ globalThis.DOMParser = class DOMParser {
       get lastChild() { return root; },
       get children() { return [root]; },
       get childNodes() { return [root]; },
-      // Document metadata the WHATWG interface exposes; DOMParser documents have
-      // URL about:blank, are already fully parsed, and carry no stylesheets.
-      get URL() { return "about:blank"; },
-      get documentURI() { return "about:blank"; },
+      // Inert documents inherit the parser realm's URL, not its browsing context.
+      get URL() { return parserURL; },
+      get documentURI() { return parserURL; },
       get domain() { return _incumbentDocumentDomain(); },
       set domain(value) { String(value); _throwDocumentDomainSecurityError(); },
       get referrer() { return ""; },
-      get baseURI() { return "about:blank"; },
+      get baseURI() { return Node.prototype.__lookupGetter__('baseURI').call(this); },
       get compatMode() { return "CSS1Compat"; },
       get characterSet() { return "UTF-8"; },
       get charset() { return "UTF-8"; },
@@ -12322,7 +12380,7 @@ globalThis.DOMParser = class DOMParser {
       _documentShim: true,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
-        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+        return Node.prototype.cloneNode.call(this, deep);
       },
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
@@ -18291,20 +18349,63 @@ if (!Document.prototype.getElementsByTagNameNS) {
 // ---- Attr nodes and createAttribute ----
 // Attr class: represents attribute nodes (nodeType 2)
 if (!globalThis.Attr) {
-  globalThis.Attr = class Attr {
+  globalThis.Attr = class Attr extends Node {
     constructor(name, value = '', namespaceURI = null, prefix = null) {
+      super(undefined);
       this.name = name;
-      this.localName = name;
-      this.value = value;
+      this.localName = prefix ? name.slice(prefix.length + 1) : name;
+      this._value = String(value);
       this.namespaceURI = namespaceURI;
       this.prefix = prefix;
       this.ownerElement = null;
       this.specified = true;
     }
+    get [Symbol.toStringTag]() { return 'Attr'; }
+    get ownerDocument() { return this.ownerElement?.ownerDocument || this._nodeDocument || document; }
+    get value() {
+      if (this.ownerElement) {
+        const value = this.namespaceURI
+          ? this.ownerElement.getAttributeNS(this.namespaceURI, this.localName)
+          : this.ownerElement.getAttribute(this.name);
+        if (value !== null) return value;
+      }
+      return this._value;
+    }
+    set value(value) {
+      this._value = String(value);
+      if (this.ownerElement) {
+        if (this.namespaceURI) this.ownerElement.setAttributeNS(this.namespaceURI, this.name, this._value);
+        else this.ownerElement.setAttribute(this.name, this._value);
+      }
+    }
     get nodeName() { return this.name; }
     get nodeValue() { return this.value; }
     set nodeValue(v) { this.value = v; }
     get nodeType() { return 2; }
+    get textContent() { return this.value; }
+    set textContent(value) { this.value = value == null ? '' : value; }
+    // Attributes have no arena node or tree children.
+    get parentNode() { return null; }
+    get parentElement() { return null; }
+    get childNodes() { return _nodeList([]); }
+    get firstChild() { return null; }
+    get lastChild() { return null; }
+    get nextSibling() { return null; }
+    get previousSibling() { return null; }
+    get isConnected() { return false; }
+    hasChildNodes() { return false; }
+    getRootNode() { return this; }
+    contains(other) { return other === this; }
+    isSameNode(other) { return other === this; }
+    isEqualNode(other) {
+      return other?.nodeType === 2 && this.namespaceURI === other.namespaceURI
+        && this.prefix === other.prefix && this.localName === other.localName && this.value === other.value;
+    }
+    cloneNode() {
+      const clone = new Attr(this.name, this.value, this.namespaceURI, this.prefix);
+      clone._nodeDocument = this.ownerDocument;
+      return clone;
+    }
   };
 }
 
@@ -18337,7 +18438,9 @@ if (!Document.prototype.createAttribute) {
     if (!_ns_isValidXmlName(name)) {
       throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
     }
-    return new Attr(name, '', null, null);
+    const attr = new Attr(name, '', null, null);
+    attr._nodeDocument = this;
+    return attr;
   };
   _markNative(Document.prototype.createAttribute);
 }
@@ -18364,7 +18467,9 @@ if (!Document.prototype.createAttributeNS) {
         throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
       }
     }
-    return new Attr(qn, '', ns, prefix);
+    const attr = new Attr(qn, '', ns, prefix);
+    attr._nodeDocument = this;
+    return attr;
   };
   _markNative(Document.prototype.createAttributeNS);
 }
@@ -18372,11 +18477,7 @@ if (!Document.prototype.createAttributeNS) {
 // Element.prototype.getAttributeNode: return an Attr node or null
 if (!Element.prototype.getAttributeNode) {
   Element.prototype.getAttributeNode = function(name) {
-    const val = this.getAttribute(name);
-    if (val === null) return null;
-    const attr = new Attr(name, val, null, null);
-    attr.ownerElement = this;
-    return attr;
+    return this.attributes.getNamedItem(_htmlAttrName(this, String(name)));
   };
   _markNative(Element.prototype.getAttributeNode);
 }
@@ -18384,12 +18485,7 @@ if (!Element.prototype.getAttributeNode) {
 // Element.prototype.getAttributeNodeNS: return a namespaced Attr node or null
 if (!Element.prototype.getAttributeNodeNS) {
   Element.prototype.getAttributeNodeNS = function(namespaceURI, localName) {
-    const val = this.getAttributeNS(namespaceURI, localName);
-    if (val === null) return null;
-    const name = String(localName || '');
-    const attr = new Attr(name, val, namespaceURI ? String(namespaceURI) : null, null);
-    attr.ownerElement = this;
-    return attr;
+    return this.attributes.getNamedItemNS(namespaceURI, localName);
   };
   _markNative(Element.prototype.getAttributeNodeNS);
 }
