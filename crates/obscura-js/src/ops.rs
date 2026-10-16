@@ -2644,6 +2644,33 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
+        "parse_html_document" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            if root == dom.document() || !dom.with_node(root, |node| matches!(node.data, NodeData::Document)).unwrap_or(false)
+                || !dom.children(root).is_empty()
+            {
+                return "null".into();
+            }
+            use html5ever::tendril::TendrilSink;
+            let mut options = html5ever::ParseOpts::default();
+            options.tree_builder.scripting_enabled = false;
+            let parsed = html5ever::parse_document(DomTree::new(), options).from_utf8().one(arg2.as_bytes());
+            dom.import_children_from(root, &parsed, parsed.document());
+            mark_script_subtree_started(&gs, root);
+            if parsed.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into()
+        }
+        "attribute_metadata" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let info = dom.with_node(NodeId::new(nid), |node| {
+                let attr = node.attrs()?.iter().find(|attr| attr.qualified_name_eq(&arg2))?;
+                Some(serde_json::json!({
+                    "name": attr.qualified_name(), "value": attr.value,
+                    "namespaceURI": if attr.name.ns.is_empty() { None } else { Some(attr.name.ns.as_ref()) },
+                    "prefix": attr.name.prefix.as_ref().map(|prefix| prefix.as_ref()),
+                }))
+            }).flatten();
+            serde_json::to_string(&info).unwrap_or("null".into())
+        }
         "attribute_names" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let names: Vec<String> = dom

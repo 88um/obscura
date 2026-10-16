@@ -19996,6 +19996,103 @@ mod tests {
     }
 
     #[test]
+    fn document_clones_preserve_metadata_and_native_control_state() {
+        let mut rt = setup_runtime("<!doctype html><!--before--><html lang=en><head><base href='http://example.com/articles/'><title>Article</title></head><body><input id=field value=initial><template id=t><p>Template</p></template><p id=copy>Original</p></body></html><!--after-->");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.getElementById('field').value='edited';
+            const shallow=document.cloneNode(false), clone=document.cloneNode(true);
+            if (!shallow || !clone) return 'missing document clone';
+            clone.getElementById('copy').textContent='Changed';
+            return [clone instanceof Document, clone.nodeType, clone.ownerDocument, clone.defaultView,
+                clone.URL, clone.documentURI, clone.baseURI, clone.contentType, clone.compatMode,
+                clone.characterSet, shallow.childNodes.length, shallow.URL, shallow.compatMode,
+                Array.from(clone.childNodes,n=>n.nodeType), clone.doctype.name,
+                clone.documentElement.ownerDocument===clone, clone.body.ownerDocument===clone,
+                clone.getElementById('field').value, clone.getElementById('field').getAttribute('value'),
+                clone.getElementById('t').content.textContent, document.getElementById('copy').textContent];
+        })()"#).unwrap(), serde_json::json!([true,9,null,null,"http://example.com/test","http://example.com/test","http://example.com/articles/","text/html","CSS1Compat","UTF-8",0,"http://example.com/test","CSS1Compat",[10,8,1,8],"html",true,true,"edited","initial","Template","Original"]));
+    }
+
+    #[test]
+    fn document_clones_preserve_xml_interfaces_namespaces_and_quirks_mode() {
+        let mut rt = setup_runtime("<p>Quirks</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const source=document.implementation.createDocument('urn:article','p:article',null);
+            source.documentElement.setAttributeNS('urn:meta','m:kind','article');
+            const clone=source.cloneNode(true), quirks=document.cloneNode(false);
+            if (!clone || !quirks) return 'missing document clone';
+            return [clone instanceof XMLDocument, clone.contentType, clone.documentElement.nodeName,
+                clone.documentElement.namespaceURI, clone.documentElement.getAttributeNS('urn:meta','kind'),
+                clone.documentElement.ownerDocument===clone, clone.defaultView, quirks.compatMode];
+        })()"#).unwrap(), serde_json::json!([true,"application/xml","p:article","urn:article","article",true,null,"BackCompat"]));
+    }
+
+    #[test]
+    fn attribute_clones_are_independent_nodes_with_the_original_namespace_and_owner() {
+        let mut rt = setup_runtime("<div id=source data-value=old></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const source=document.getElementById('source');
+            source.setAttributeNS('urn:meta','m:kind','article');
+            const attr=source.attributes.getNamedItem('m:kind');
+            if (typeof attr.cloneNode!=='function') return 'missing attribute clone';
+            const clone=attr.cloneNode(true);
+            clone.value='copy';
+            const foreign=document.implementation.createHTMLDocument('Foreign');
+            const detached=foreign.createAttributeNS('urn:meta','m:kind');
+            detached.value='detached';
+            const detachedClone=detached.cloneNode(false);
+            return [attr instanceof Attr, attr instanceof Node, Object.prototype.toString.call(attr),
+                clone.nodeType, clone.name, clone.localName, clone.namespaceURI, clone.prefix,
+                clone.ownerElement, clone.ownerDocument===document, clone.parentNode,
+                clone.childNodes.length, clone.getRootNode()===clone, clone.isConnected,
+                clone.value, clone.nodeValue, clone.textContent, source.getAttributeNS('urn:meta','kind'),
+                clone!==attr, !clone.isSameNode(attr), !clone.isEqualNode(attr),
+                detachedClone.ownerDocument===foreign, detachedClone.value, detachedClone.namespaceURI];
+        })()"#).unwrap(), serde_json::json!([true,true,"[object Attr]",2,"m:kind","kind","urn:meta","m",null,true,null,0,true,false,"copy","copy","copy","article",true,true,true,true,"detached","urn:meta"]));
+    }
+
+    #[test]
+    fn parsed_document_clones_keep_the_url_and_do_not_reparse_or_run_scripts() {
+        let mut rt = setup_runtime("<!doctype html><title>Live</title><p>Live body</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed=new DOMParser().parseFromString('<title>Inert</title><script>window.executed=true</script><input id=field value=initial>','text/html');
+            parsed.getElementById('field').value='edited';
+            const clone=parsed.cloneNode(true), shallow=parsed.cloneNode(false);
+            return [parsed.URL, clone.URL, clone instanceof Document, clone.defaultView,
+                clone.getElementById('field').value, clone.getElementById('field').getAttribute('value'),
+                clone.getElementById('field').ownerDocument===clone, shallow.childNodes.length,
+                document.title, typeof window.executed];
+        })()"#).unwrap(), serde_json::json!(["http://example.com/test","http://example.com/test",true,null,"edited","initial",true,0,"Live","undefined"]));
+    }
+
+    #[test]
+    fn attribute_node_positions_do_not_alias_missing_arena_ids() {
+        let mut rt = setup_runtime("<div id=x a=1 b=2></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const el=document.getElementById('x'), a=el.attributes[1], b=el.attributes[2];
+            const clone=a.cloneNode(), forward=clone.compareDocumentPosition(a), reverse=a.compareDocumentPosition(clone);
+            return [a.compareDocumentPosition(el),el.compareDocumentPosition(a),
+                a.compareDocumentPosition(b),b.compareDocumentPosition(a),
+                (forward & 33)===33,(reverse & 33)===33,
+                (forward & 6)===(reverse & 4 ? 2 : 4),clone.compareDocumentPosition(clone)];
+        })()"#).unwrap(), serde_json::json!([10,20,36,34,true,true,true,0]));
+    }
+
+    #[test]
+    fn inert_html_parsing_preserves_document_root_attributes_and_structure() {
+        let mut rt = setup_runtime("<title>Live page</title><p>Live content</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed=new DOMParser().parseFromString('<!doctype html><!--before--><html lang=fr dir=rtl data-root=article><head><title>Parsed</title></head><body><template id=t><p>Template</p></template><script>window.executed=true</script><noscript><img src=fallback.jpg></noscript><p id=content>Article</p></body></html><!--after-->','text/html');
+            return [parsed instanceof Document, parsed.URL, parsed.documentElement.lang,
+                parsed.documentElement.dir, parsed.documentElement.getAttribute('data-root'),
+                Array.from(parsed.childNodes,n=>n.nodeType), parsed.doctype?.name,
+                parsed.body.ownerDocument===parsed, parsed.getElementById('t').content.textContent,
+                parsed.title, parsed.compatMode, parsed.defaultView, document.title, typeof window.executed,
+                parsed.querySelector('noscript img')?.getAttribute('src')];
+        })()"#).unwrap(), serde_json::json!([true,"http://example.com/test","fr","rtl","article",[10,8,1,8],"html",true,"Template","Parsed","CSS1Compat",null,"Live page","undefined","fallback.jpg"]));
+    }
+
+    #[test]
     fn deep_document_element_clone_stays_an_independent_html_element() {
         let mut rt = setup_runtime(
             r#"<html lang="en" data-root="original"><head><title>Clone</title></head><body><main id="app" data-state="source"><p class="item">original text</p></main></body></html>"#,
