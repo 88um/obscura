@@ -137,27 +137,14 @@ impl BrowserState {
         id
     }
 
-    /// Enforce the single-live-isolate invariant. rusty_v8 enters each V8
-    /// isolate on creation and requires isolates be dropped in reverse order of
-    /// creation, so keeping more than one tab's isolate live at once and then
-    /// dropping a non-newest one aborts the whole process (#258). Suspend every
-    /// other tab (drops its isolate, keeps its DOM in self.dom) and make the
-    /// active tab the only live isolate, mirroring the CDP server's
-    /// Dispatcher::get_session_page_mut.
+    /// Scoped isolate entries allow inactive tabs to keep their realms, as in CDP.
     fn activate(&mut self, tab_id: &str) {
-        for (id, page) in self.tabs.iter_mut() {
-            if id.as_str() != tab_id && page.has_js() {
-                page.suspend_js();
-            }
-        }
         if let Some(page) = self.tabs.get_mut(tab_id) {
-            page.resume_js();
+            if !page.has_js() { page.resume_js(); }
         }
     }
 
-    /// Close a tab without breaking the LIFO isolate-drop rule. suspend_js drops
-    /// this tab's isolate (if it is the live one) while it is still the only
-    /// entered isolate, so the following remove disposes no isolate (#258).
+    /// Retire frame handles before disposing their owning runtime.
     fn close_tab(&mut self, tab_id: &str) -> bool {
         if let Some(page) = self.tabs.get_mut(tab_id) {
             page.suspend_js();
@@ -1335,9 +1322,7 @@ fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
 }
 
 fn tool_close(state: &mut BrowserState) -> Result<String, String> {
-    // Drop the one live isolate (if any) via suspend_js before clearing, so the
-    // map drop disposes no isolate and the LIFO rule holds regardless of the
-    // BTreeMap's ascending drop order (#258).
+    // Retire each page's frame handles before clearing the tab map.
     for page in state.tabs.values_mut() {
         page.suspend_js();
     }
@@ -2297,6 +2282,48 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tab_switch_preserves_globals_listeners_and_pending_promises() {
+        let mut state = BrowserState::new(None, None, false);
+        let mut tabs = Vec::new();
+        for index in 0..3 {
+            tool_tab_new(&json!({"url":"data:text/html,<button id=action>Increment</button>"}), &mut state).await.unwrap();
+            tabs.push(state.active_tab.clone().unwrap());
+            evaluate_tool_script(state.page_mut(), &format!(
+                "const tabToken={index}; window.counter=40; document.querySelector('button').addEventListener('click',()=>window.counter++); window.pending=new Promise(resolve=>{{window.finishPending=resolve}}); true"
+            )).unwrap();
+        }
+        for index in [1, 0, 2] {
+            tool_tab_switch(&json!({"tab_id":tabs[index]}), &mut state).unwrap();
+            assert_eq!(evaluate_tool_script(state.page_mut(), "typeof tabToken").unwrap(), json!("number"), "switching tabs must not replace a realm");
+            tool_click(&json!({"selector":"#action"}), &mut state).await.unwrap();
+            assert_eq!(evaluate_tool_script(state.page_mut(), "[tabToken,window.counter]").unwrap(), json!([index,41]));
+            let result = tool_evaluate(&json!({"expression":"(function(){window.finishPending('retained');return window.pending})()"}), &mut state).await.unwrap();
+            assert_eq!(result, "retained");
+        }
+        tool_close(&mut state).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_tabs_with_frames_can_close_in_any_order_and_reopen() {
+        let mut state = BrowserState::new(None, None, false);
+        let mut tabs = Vec::new();
+        for index in 0..3 {
+            tool_tab_new(&json!({"url":"data:text/html,<iframe srcdoc='<p>Child frame</p>'></iframe>"}), &mut state).await.unwrap();
+            tabs.push(state.active_tab.clone().unwrap());
+            evaluate_tool_script(state.page_mut(), &format!("document.querySelector('iframe').contentWindow.frameToken={index}")).unwrap();
+        }
+        tool_tab_switch(&json!({"tab_id":tabs[0]}), &mut state).unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "document.querySelector('iframe').contentWindow.frameToken").unwrap().as_f64(), Some(0.0));
+        for index in [1,0,2] {
+            tool_tab_close(&json!({"tab_id":tabs[index]}), &mut state).unwrap();
+        }
+        assert!(state.tabs.is_empty());
+        tool_tab_new(&json!({"url":"data:text/html,<p>New session</p>"}), &mut state).await.unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "6*7").unwrap().as_f64(), Some(42.0));
+        tool_close(&mut state).unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_references_are_actionable_without_an_extra_listing() {
