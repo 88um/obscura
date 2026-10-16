@@ -1527,6 +1527,13 @@ impl Page {
                 }
             }
         }
+        // A synchronously initialized parent may not be in self.frames yet.
+        // Its children's native owner chain still proves they are connected.
+        if let Some(js) = &self.js {
+            for pending in &self.pending_frame_work {
+                if js.frame_is_active(pending.frame_id()) { live.push(pending.frame_id()); }
+            }
+        }
         let mut discarded_ids: std::collections::HashSet<u32> = self
             .frames
             .iter()
@@ -7103,6 +7110,231 @@ mod tests {
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    async fn pump_srcdoc_frames(page: &mut super::Page) {
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2),
+                page.js.as_mut().unwrap().run_event_loop()).await.unwrap().unwrap();
+            if !page.advance_frames().await { break; }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_loads_parser_and_inserted_documents_in_their_own_realms() {
+        let mut page = import_map_test_page("srcdoc", "https://parent.test",
+            r#"<html><head><base href="https://assets.test/dir/"></head><body>
+            <iframe id="parsed" src="data:text/html,FALLBACK" srcdoc="&lt;p&gt;parsed&lt;/p&gt;"></iframe>
+            </body></html>"#);
+        page.evaluate_script(r#"(() => {
+            globalThis.loads = [];
+            localStorage.setItem('shared', 'parent');
+            const frame = document.createElement('iframe'); frame.id = 'inserted';
+            frame.srcdoc = '<p>inserted</p><script>globalThis.childOnly=42;document.body.dataset.ready="yes";</script>';
+            frame.onload = () => loads.push([frame.contentDocument.URL,
+                frame.contentDocument.body.dataset.ready, frame.contentWindow.childOnly]);
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let value = page.evaluate_script(r#"(() => {
+            const parsed = document.getElementById('parsed').contentDocument;
+            const f = document.getElementById('inserted'), d = f.contentDocument;
+            const a = d.createElement('a'); a.href = 'next';
+            return [parsed.URL, parsed.body.textContent, d.URL, d.baseURI, a.href,
+                f.contentWindow.localStorage.getItem('shared'), typeof globalThis.childOnly,
+                loads, d.defaultView === f.contentWindow, parsed.compatMode];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["about:srcdoc", "parsed", "about:srcdoc",
+            "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
+            [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_replacement_cancels_stale_documents() {
+        let mut page = import_map_test_page("srcdoc-replace", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.executed = []; globalThis.loaded = [];
+            const host = document.createElement('div');
+            host.innerHTML = '<iframe id="f" srcdoc="first"></iframe>';
+            document.body.appendChild(host);
+            const f = document.getElementById('f');
+            f.onload = () => loaded.push(f.contentDocument.body.textContent);
+            f.setAttributeNS(null, 'srcdoc', '<script>parent.executed.push("stale")</script>stale');
+            f.srcdoc = '<script>parent.executed.push("latest")</script><p>latest</p>';
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[executed, loaded.map(text => text.endsWith('latest')), document.getElementById('f').srcdoc.includes('<p>latest</p>')]").unwrap(),
+            serde_json::json!([["latest"], [true], true]));
+        page.evaluate_script("document.getElementById('f').removeAttribute('srcdoc'); 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("document.getElementById('f').contentDocument.URL").unwrap(),
+            serde_json::json!("about:blank"));
+        assert!(page.frames.len() <= 1, "replaced srcdoc realms must be released");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_sandbox_blocks_scripts_and_opaque_document_access() {
+        let mut page = import_map_test_page("srcdoc-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN']]) {
+                const f = document.createElement('iframe'); f.id = id;
+                f.setAttribute('sandbox', policy);
+                f.srcdoc = '<button onclick="parent.escaped=true">hello</button><script>globalThis.ran=true;try{parent.escaped=true}catch(e){}</script><noscript><i>fallback</i></noscript>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const opaque = document.getElementById('opaque');
+            const inert = document.getElementById('inert');
+            inert.contentDocument.querySelector('button').click();
+            return [opaque.contentDocument === null, inert.contentDocument.URL,
+                inert.contentDocument.querySelector('button').textContent,
+                typeof inert.contentWindow.ran, escaped,
+                inert.contentDocument.querySelector('noscript i')?.textContent];
+        })()"#).unwrap(), serde_json::json!([true, "about:srcdoc", "hello", "undefined", false, "fallback"]));
+        assert_eq!(page.evaluate_in_frame(0, "[document.URL, globalThis.ran, location.origin]").unwrap(),
+            serde_json::json!(["about:srcdoc", true, "null"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_nested_and_empty_documents_keep_the_creator_base() {
+        let mut page = import_map_test_page("srcdoc-nested", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.id = 'outer';
+            f.srcdoc = '<base href="https://nested.test/path/"><iframe srcdoc=""></iframe>';
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const child = document.getElementById('outer').contentDocument.querySelector('iframe');
+            return [child.contentDocument.URL, child.contentDocument.baseURI,
+                child.contentDocument.body.textContent,
+                child.contentWindow.parent === document.getElementById('outer').contentWindow];
+        })()"#).unwrap(), serde_json::json!(["about:srcdoc", "https://nested.test/path/", "", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_from_connected_inner_html_survives_initial_document_reads() {
+        let mut page = import_map_test_page("srcdoc-connected", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            document.body.innerHTML = '<iframe id="f" srcdoc="hello"></iframe>';
+            globalThis.initial = document.getElementById('f').contentDocument.URL;
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[initial, document.getElementById('f').contentDocument.URL, document.getElementById('f').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc", "hello"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_external_scripts_resolve_against_the_creator() {
+        let (base, requests) = spawn_nested_pending_frame_server().await;
+        let mut page = import_map_test_page("srcdoc-script-base", &base,
+            r#"<body><iframe srcdoc="&lt;script src=child.js&gt;&lt;/script&gt;"></iframe></body>"#);
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(*requests.lock().unwrap(), vec!["/app/child.js"]);
+        assert_eq!(page.evaluate_script("document.querySelector('iframe').contentWindow.__mustNotRun").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_inherits_sandbox_restrictions_in_nested_documents() {
+        let mut page = import_map_test_page("srcdoc-inherited-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            for (const policy of ['allow-scripts', 'allow-same-origin']) {
+                const f = document.createElement('iframe'); f.id = policy; f.setAttribute('sandbox', policy);
+                f.srcdoc = '<iframe srcdoc="&lt;script&gt;globalThis.ran=true&lt;/script&gt;"></iframe>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_in_frame(0, "document.querySelector('iframe').contentDocument === null").unwrap(),
+            serde_json::json!(true));
+        assert_eq!(page.evaluate_script("typeof document.getElementById('allow-same-origin').contentDocument.querySelector('iframe').contentWindow.ran").unwrap(),
+            serde_json::json!("undefined"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_ignores_absent_attributes_and_non_html_elements() {
+        let mut page = import_map_test_page("srcdoc-noop", "https://parent.test", "<body></body>");
+        let values = page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            f.contentWindow.kept = 73;
+            f.removeAttribute('srcdoc');
+            const first = f.contentWindow.kept;
+            f.removeAttributeNS(null, 'srcdoc');
+            const second = f.contentWindow.kept;
+            const plain = document.createElement('div'); plain.srcdoc = 'expando';
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'iframe');
+            svg.setAttribute('srcdoc', '<script>parent.escaped=true</script>');
+            const host = document.createElement('div'); host.appendChild(svg);
+            document.body.appendChild(host);
+            return [first, second, plain.hasAttribute('srcdoc')];
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(values, serde_json::json!([73, 73, false]));
+        assert_eq!(page.evaluate_script("escaped").unwrap(), serde_json::json!(false));
+        assert_eq!(page.frames.len(), 1, "SVG iframe is not a browsing context");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_navigation_waits_until_after_the_microtask_checkpoint() {
+        let mut page = import_map_test_page("srcdoc-task", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.srcdoc = 'hello';
+            document.body.appendChild(f);
+            Promise.resolve().then(() => { globalThis.beforeNavigation = f.contentDocument.URL; });
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[beforeNavigation, document.querySelector('iframe').contentDocument.URL]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_is_ready_after_data_document_navigation() {
+        let mut page = import_map_test_page("srcdoc-data-navigation", "https://parent.test", "<body></body>");
+        page.navigate("data:text/html,%3Ciframe%20srcdoc%3D%22HELLO%22%3E%3C%2Fiframe%3E").await.unwrap();
+        assert_eq!(page.evaluate_script("[document.querySelector('iframe').contentDocument.URL, document.querySelector('iframe').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:srcdoc", "HELLO"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_opaque_document_is_not_published_to_creator_objects() {
+        let mut page = import_map_test_page("srcdoc-private-realm", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.seenOpaqueSource = false;
+            const f = document.createElement('iframe'); f.id = 'opaque';
+            f.setAttribute('sandbox', 'allow-scripts');
+            f.srcdoc = '<p>private</p><script>parent.postMessage("loaded", "*")</script>';
+            window.addEventListener('message', event => {
+                seenOpaqueSource = event.data === 'loaded' && event.source === f.contentWindow;
+            });
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const f = document.getElementById('opaque');
+            const references = [
+                () => f._iframeDoc,
+                () => f._iframeWin?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.window?.document,
+            ];
+            const readable = references.map(getDocument => {
+                try { return getDocument()?.body?.textContent ?? null; }
+                catch (_) { return null; }
+            });
+            return [f.contentDocument === null, readable, seenOpaqueSource];
+        })()"#).unwrap(), serde_json::json!([true, [null, null, null, null], true]));
     }
 
     #[tokio::test(flavor = "current_thread")]

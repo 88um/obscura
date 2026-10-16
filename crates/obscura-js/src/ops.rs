@@ -325,9 +325,11 @@ struct StorageOriginCache {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
-    /// Initial about:blank documents retain their creator's base URL and origin.
+    /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
     pub(crate) inherited_origin: Option<String>,
+    pub(crate) scripting_enabled: bool,
+    pub(crate) sandbox_opaque_origin: bool,
     storage_origin_cache: RefCell<StorageOriginCache>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
@@ -629,6 +631,8 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
+            scripting_enabled: true,
+            sandbox_opaque_origin: false,
             storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
             encoding: "UTF-8".to_string(),
             content_type: String::new(),
@@ -1162,7 +1166,7 @@ impl RealmStates {
         }).owner = Some((Rc::downgrade(parent), node, generation));
     }
 
-    fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
+    pub(crate) fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
         // A child document is active only while all of its owners are active.
         // Keep the walk bounded even if an invalid frame-parent chain arrives.
         for _ in 0..=self.frame_timers.len() {
@@ -2385,6 +2389,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "scripting_enabled" => gs.scripting_enabled.to_string(),
+        "sandbox_opaque_origin" => gs.sandbox_opaque_origin.to_string(),
         "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
             url::Url::parse(&gs.url).map(|url| url.origin().ascii_serialization())
                 .unwrap_or_else(|_| "null".to_string())
@@ -6596,22 +6602,25 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
-/// An initial about:blank needs its own realm before the next JS statement.
-#[op2(nofast)]
+/// Initial blank and srcdoc documents share their creator's realm setup.
+#[op2]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
     parent_frame_id: u32,
     initialize: v8::Local<v8::Function>,
     owner_node: u32,
+    #[string] srcdoc: Option<String>,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
         let parent_state = frame_state(state, parent_frame_id);
+        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
-            || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
+            || page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
         {
             return 0;
         }
@@ -6635,16 +6644,31 @@ fn op_initial_frame(
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
         child.set_viewport(300.0, 150.0);
+        let opaque;
         {
             let parent = parent_state.borrow();
-            child.dom = Some(obscura_dom::parse_html(
-                "<html><head></head><body></body></html>"));
+            let sandbox = srcdoc.as_ref().and_then(|_| parent.dom.as_ref())
+                .and_then(|dom| dom.with_node(NodeId::new(owner_node), |node|
+                    node.get_attribute("sandbox").map(str::to_owned)).flatten());
+            opaque = parent.sandbox_opaque_origin || sandbox.as_deref().is_some_and(|value|
+                !value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-same-origin")));
+            child.sandbox_opaque_origin = opaque;
+            child.url = frame_url.to_string();
             child.frame_id = frame_id;
             child.about_base_url = document_base_url(&parent);
-            child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
+            child.scripting_enabled = parent.scripting_enabled && sandbox.as_deref().is_none_or(|value|
+                value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-scripts")));
+            child.dom = Some(if let Some(html) = srcdoc.as_deref() {
+                obscura_dom::parse_srcdoc(html, child.scripting_enabled)
+            } else {
+                obscura_dom::parse_html("<html><head></head><body></body></html>")
+            });
+            child.inherited_origin = Some(if opaque { "null".to_string() } else {
+                parent.inherited_origin.clone().unwrap_or_else(|| {
                 url::Url::parse(&parent.url).map(|url| url.origin().ascii_serialization())
                     .unwrap_or_else(|_| "null".to_string())
-            }));
+                })
+            });
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
@@ -6653,16 +6677,20 @@ fn op_initial_frame(
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
-        if initialize.call(scope, receiver.into(), &[window.into(), id.into()]).is_none() {
+        let opaque_value = v8::Boolean::new(scope, opaque);
+        if initialize.call(scope, receiver.into(), &[window.into(), id.into(), opaque_value.into()]).is_none() {
             registry.borrow_mut().forget(&handle);
             return 0;
         }
+        // Initialization needs the creator's token; author code must never
+        // retain it when the sandbox requires an opaque origin.
+        if opaque { context.use_default_security_token(); }
         let mut page = page.borrow_mut();
-        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
         page.pending_frames.push(PendingFrame {
             frame_id,
             parent_frame_id,
-            url: "about:blank".to_string(),
+            url: frame_url.to_string(),
             html: String::new(),
             viewport_width: 300,
             viewport_height: 150,

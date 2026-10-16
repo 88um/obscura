@@ -91,7 +91,12 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        let (scripting_enabled, sandbox_opaque_origin) = realms.borrow().by_frame_id(parent_frame_id)
+            .map(|creator| {
+                let creator = creator.borrow();
+                (creator.scripting_enabled, creator.sandbox_opaque_origin)
+            }).unwrap_or((true, false));
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -102,6 +107,9 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -356,6 +364,14 @@ impl FrameRealm {
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
     fn resolve(&self, src: &str) -> String {
+        if self.url == "about:srcdoc" {
+            if let Some(base) = self.realms.borrow().by_frame_id(self.frame_id)
+                .and_then(|state| crate::ops::document_base_url(&state.borrow()))
+            {
+                return url::Url::parse(&base).and_then(|base| base.join(src))
+                    .map(|url| url.to_string()).unwrap_or_else(|_| src.to_string());
+            }
+        }
         url::Url::parse(&self.url)
             .and_then(|base| base.join(src))
             .map(|url| url.to_string())
@@ -367,6 +383,7 @@ impl FrameRealm {
         let state = self.realms.borrow().by_frame_id(self.frame_id)
             .ok_or_else(|| "could not list frame scripts: missing realm".to_string())?;
         let state = state.borrow();
+        if !state.scripting_enabled { return Ok(Vec::new()); }
         let dom = state.dom.as_ref()
             .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
         let nodes = dom.query_selector_all("script")?;

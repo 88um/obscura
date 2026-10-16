@@ -2161,7 +2161,10 @@ function _domEventDispatch(target, event) {
 // browser custom-element implementations.
 const _customElementConstructionStack = [];
 
+let _scriptingEnabled = true;
+let _sandboxOpaqueOrigin = false;
 function __prepareInsertedScript(script) {
+  if (!_scriptingEnabled) return;
   if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
@@ -2338,11 +2341,12 @@ function __prepareInsertedSubtree(root) {
   if (!root || !root.isConnected) return;
   const scripts = [];
   const seen = new Set();
-  if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
+  if (root.nodeType === 1 && (root.tagName === 'SCRIPT'
+      || (root.tagName === 'IFRAME' && root.hasAttribute('srcdoc')))) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe[srcdoc]") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2352,7 +2356,8 @@ function __prepareInsertedSubtree(root) {
   }
   for (const script of scripts) {
     if (_postConnection) _postConnection.cursor = script;
-    __prepareInsertedScript(script);
+    if (script.localName === 'iframe') script._loadIframeSrcdoc();
+    else __prepareInsertedScript(script);
   }
 }
 
@@ -4121,12 +4126,14 @@ class Element extends Node {
     if (globalThis.__mutationObservers?.length) {
       oldChildren = _domParse("child_nodes", this._nid) || [];
     }
-    _dom("set_inner_html", this._nid, String(v ?? ""));
+    const html = String(v ?? "");
+    _dom("set_inner_html", this._nid, html);
     // HTML fragment parsing can introduce IDs without calling the JS
     // setAttribute path. Register those elements for Window named access
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
+    _connectSrcdocFrames(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -4249,13 +4256,14 @@ class Element extends Node {
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
-    if (n === "src" && this.localName === "iframe") {
+    if (n === "src" && this.localName === "iframe" && !this.hasAttribute('srcdoc')) {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
+    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
@@ -4296,10 +4304,12 @@ class Element extends Node {
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
+    if (n === 'srcdoc' && this.localName === 'iframe' && !this.hasAttribute(n)) return;
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
@@ -4310,6 +4320,7 @@ class Element extends Node {
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
+    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
@@ -4335,10 +4346,12 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -4471,6 +4484,7 @@ class Element extends Node {
     return _domEventDispatch(this, event);
   }
   _resolveInlineHandler(name) {
+    if (!_scriptingEnabled) return null;
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
     // as a function body on first read and cache it on the instance.
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
@@ -5080,6 +5094,8 @@ class Element extends Node {
     _resetIframeElement(this);
   }
   _loadIframeSrc(url) {
+    if (this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
+    if (url === 'about:blank' || !url) { this._resetIframeFrame(); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -5102,6 +5118,7 @@ class Element extends Node {
         const html = response.body || '';
         const loadedUrl = response.url || fullUrl;
         el._iframeLoadedUrl = loadedUrl;
+        el._iframeOpaque = _sandboxOpaqueOrigin;
         // The host fires load after creating the realm and running its scripts.
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
@@ -5138,10 +5155,33 @@ class Element extends Node {
       el.dispatchEvent(new Event('load'));
     });
   }
+  _loadIframeSrcdoc(force = false) {
+    if (this.namespaceURI !== 'http://www.w3.org/1999/xhtml' || !this.isConnected) return;
+    const html = this.getAttribute('srcdoc');
+    if (html === null) return;
+    if (!force && this._iframeLoadingUrl === 'about:srcdoc' && this._iframeSrcdoc === html) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = 'about:srcdoc';
+    this._iframeSrcdoc = html;
+    // Coalesce attribute writes into one navigation task, after microtasks.
+    if (this._iframeSrcdocTaskPending) return;
+    this._iframeSrcdocTaskPending = true;
+    _browserPostedTaskEnqueue(() => {
+      this._iframeSrcdocTaskPending = false;
+      if (!this.isConnected || this._iframeLoadingUrl !== 'about:srcdoc' || !this.hasAttribute('srcdoc')) return;
+      if (this._frameId) globalThis.__obscura_forgetFrame(this._frameId);
+      this._frameId = 0;
+      _ensureInitialFrameRealm(this, this._iframeSrcdoc);
+      this._iframeLoadedUrl = 'about:srcdoc';
+    }, _schedulerPriorityRank['user-visible'] * 2, _browserPostedTaskGeneration(), () => {
+      this._iframeSrcdocTaskPending = false;
+    });
+  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
+    if (this._iframeOpaque) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -5165,6 +5205,7 @@ class Element extends Node {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
+    if (this._iframeOpaque && this._frameId) return _remoteWindow(this._frameId);
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -6921,6 +6962,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
+    _connectSrcdocFrames(this, html);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
@@ -13916,7 +13958,10 @@ globalThis.HTMLTableElement = Element;
 // element passed `instanceof HTMLIFrameElement`, so style-loader's
 // "insert target is an iframe" branch took `contentDocument.head` of <head>
 // itself and failed with "Couldn't find a style target".
-globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {};
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
+  get srcdoc() { return this.getAttribute('srcdoc') || ''; }
+  set srcdoc(value) { this.setAttribute('srcdoc', value); }
+};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
@@ -15252,12 +15297,20 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _ensureInitialFrameRealm(element) {
+function _connectSrcdocFrames(root, html) {
+  if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe[srcdoc]')));
+  }
+}
+
+function _ensureInitialFrameRealm(element, srcdoc) {
   if (element._frameId || !element.isConnected) return;
   // An opaque sandbox must never receive the creator's security token.
-  if (element.hasAttribute('sandbox') &&
-      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+  let opaque = element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
+  if (opaque && srcdoc === undefined) return false;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
+    opaque = sandboxOpaque;
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
     delete child.__obscura_core_handoff;
@@ -15270,21 +15323,26 @@ function _ensureInitialFrameRealm(element) {
     child.__obscura_frameId = id;
     child.__obscura_parentFrameId = _realmFrameId;
     child.__obscura_init();
-    Object.defineProperties(child, {
-      parent: { value: globalThis, configurable: true },
-      top: { value: globalThis.top, configurable: true },
-      frameElement: { value: element, configurable: true },
-    });
+    if (!opaque) {
+      Object.defineProperties(child, {
+        parent: { value: globalThis, configurable: true },
+        top: { value: globalThis.top, configurable: true },
+        frameElement: { value: element, configurable: true },
+      });
+      globalThis.__obscura_frameObjects[id] = {
+        window: child, document: child.document, initial: true,
+      };
+    }
     child.innerWidth = 300;
     child.innerHeight = 150;
-    globalThis.__obscura_frameObjects[id] = {
-      window: child, document: child.document, initial: true,
-    };
-  }, element._nid);
+  }, element._nid, srcdoc);
   if (frameId) {
     element._frameId = frameId;
-    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
-    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    element._iframeOpaque = opaque;
+    element._iframeWin = opaque ? _remoteWindow(frameId)
+      : globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = opaque ? null
+      : globalThis.__obscura_frameObjects[frameId].document;
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
@@ -15293,6 +15351,7 @@ function _ensureInitialFrameRealm(element) {
 function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
   element._frameId = 0;
+  element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
   element._iframeLoadedUrl = 'about:blank';
   element._iframeDoc = new _IframeDocument(
@@ -15311,7 +15370,7 @@ function _frameWindowFor(frameId) {
   if (!frameId) return null;
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || null;
+  if (!real) return existing || _remoteWindows.get(frameId) || null;
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
@@ -15432,8 +15491,14 @@ class _IframeWindow {
     this.outerWidth = 300;
     this.outerHeight = 150;
     this.devicePixelRatio = globalThis.devicePixelRatio;
-    this.localStorage = globalThis.localStorage;
-    this.sessionStorage = globalThis.sessionStorage;
+    // Storage can throw for an opaque creator. Constructing its initial
+    // window must still succeed; enforce access restrictions on reads.
+    for (const name of ['localStorage', 'sessionStorage']) {
+      Object.defineProperty(this, name, {
+        configurable: true, enumerable: true,
+        get() { return globalThis[name]; },
+      });
+    }
     this.performance = globalThis.performance;
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
@@ -18124,6 +18189,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _scriptingEnabled = _domParse('scripting_enabled') !== false;
+  _sandboxOpaqueOrigin = _domParse('sandbox_opaque_origin') === true;
   globalThis.__obscura_update_media_preferences();
   const caretMembers = _installCaretGeometry();
   __obscuraCore.ops.op_register_document_realm(
@@ -18212,7 +18279,8 @@ globalThis.__obscura_init = function() {
   // its parent.
   for (const frame of globalThis.document.querySelectorAll('iframe')) {
     const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
+    else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
