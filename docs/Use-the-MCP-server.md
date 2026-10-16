@@ -137,6 +137,11 @@ Tabs:
 
 - `browser_tab_new`, `browser_tab_list`, `browser_tab_switch`, `browser_tab_close`
 
+Switching tabs retains JavaScript globals, event listeners, frame state and
+pending promises. Each open tab keeps its runtime in memory until closed.
+Autonomous task progress currently belongs to the active tab; retaining a tab
+does not promise that background work runs while another tab is active.
+
 Element references describe the current rendered page state and can become
 stale after navigation, interaction, scrolling, or a framework rerender. Take
 a fresh snapshot or interactive-element listing before acting again.
