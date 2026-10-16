@@ -15323,22 +15323,26 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     child.__obscura_frameId = id;
     child.__obscura_parentFrameId = _realmFrameId;
     child.__obscura_init();
-    if (!opaque) Object.defineProperties(child, {
+    if (!opaque) {
+      Object.defineProperties(child, {
         parent: { value: globalThis, configurable: true },
         top: { value: globalThis.top, configurable: true },
         frameElement: { value: element, configurable: true },
       });
+      globalThis.__obscura_frameObjects[id] = {
+        window: child, document: child.document, initial: true,
+      };
+    }
     child.innerWidth = 300;
     child.innerHeight = 150;
-    globalThis.__obscura_frameObjects[id] = {
-      window: child, document: child.document, initial: true,
-    };
   }, element._nid, srcdoc);
   if (frameId) {
     element._frameId = frameId;
     element._iframeOpaque = opaque;
-    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
-    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    element._iframeWin = opaque ? _remoteWindow(frameId)
+      : globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = opaque ? null
+      : globalThis.__obscura_frameObjects[frameId].document;
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
@@ -15366,7 +15370,7 @@ function _frameWindowFor(frameId) {
   if (!frameId) return null;
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || null;
+  if (!real) return existing || _remoteWindows.get(frameId) || null;
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
