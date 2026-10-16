@@ -40,7 +40,11 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        /// Already-decoded request body. Bytes rather than `String`: a POST the
+        /// client rewrites may be a protobuf, a gzip stream or a multipart part,
+        /// and passing those through `String` replaces every non-UTF-8 sequence
+        /// with U+FFFD before they reach the wire.
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -4063,7 +4067,7 @@ async fn fetch_url_inner(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body.map(String::into_bytes);
+                    override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
