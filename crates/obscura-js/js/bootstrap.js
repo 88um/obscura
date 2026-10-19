@@ -5975,13 +5975,19 @@ function _convertNodes(nodes) {
 }
 
 // ---- Reflected IDL attributes (WHATWG) ---------------------------------------
-// Installed ONCE on Element.prototype as shared getter/setter pairs. This is
+class HTMLOListElement extends Element {
+  get [Symbol.toStringTag]() { return "HTMLOListElement"; }
+}
+class HTMLLIElement extends Element {
+  get [Symbol.toStringTag]() { return "HTMLLIElement"; }
+}
+// Installed ONCE on shared prototypes as getter/setter pairs. This is
 // data-driven so there is no per-element defineProperty: element creation and
 // the querySelector/mutation hot paths are unaffected (each access is a normal
 // prototype getter that reads the backing attribute). Covers the global content
 // attributes reflected on every element plus the ARIAMixin (aria-* + ariaXxx).
 (function installElementReflectors() {
-  const P = Element.prototype;
+  let P = Element.prototype;
   const def = (name, get, set) => {
     if (Object.prototype.hasOwnProperty.call(P, name)) return; // never clobber an existing member
     Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true });
@@ -5996,7 +6002,7 @@ function _convertNodes(nodes) {
   };
   // IDL `long` conversion (ToInt32): finite, truncated, wrapped to 32-bit signed.
   const toLong = (v) => {
-    let n = Number(v);
+    let n = +v;
     if (!Number.isFinite(n)) n = 0;
     n = Math.trunc(n) % 4294967296;
     if (n >= 2147483648) n -= 4294967296;
@@ -6071,6 +6077,13 @@ function _convertNodes(nodes) {
     ariaValueMin: "aria-valuemin", ariaValueNow: "aria-valuenow", ariaValueText: "aria-valuetext",
   };
   for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
+
+  P = HTMLOListElement.prototype;
+  reflectBool("reversed", "reversed");
+  reflectLong("start", "start", 1);
+  reflectStr("type", "type");
+  P = HTMLLIElement.prototype;
+  reflectLong("value", "value", 0);
 })();
 
 function _parseXPathPredicate(part) {
@@ -7574,6 +7587,12 @@ function _elementClassFor(nid) {
   if (tag === "META" && globalThis.HTMLMetaElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
+  if ((tag === "OL" || tag === "LI")
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    const localName = _domParse("local_name", nid);
+    if (localName === "ol") return HTMLOListElement;
+    if (localName === "li") return HTMLLIElement;
+  }
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
@@ -7606,6 +7625,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
+    if (localName === "ol") return HTMLOListElement;
+    if (localName === "li") return HTMLLIElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "IMG") return HTMLImageElement;
@@ -14046,8 +14067,8 @@ globalThis.HTMLHtmlElement = Element;
 globalThis.HTMLBRElement = Element;
 globalThis.HTMLHRElement = Element;
 globalThis.HTMLUListElement = Element;
-globalThis.HTMLOListElement = Element;
-globalThis.HTMLLIElement = Element;
+globalThis.HTMLOListElement = HTMLOListElement;
+globalThis.HTMLLIElement = HTMLLIElement;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
