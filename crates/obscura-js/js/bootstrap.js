@@ -16849,22 +16849,31 @@ if (!globalThis.crypto.subtle) {
   }
   function makeKey(type, extractable, algorithm, usages, bytes) {
     const k = Object.create(CryptoKey.prototype);
+    const publicAlgorithm = Object.assign({}, algorithm);
+    if (algorithm.hash) publicAlgorithm.hash = Object.assign({}, algorithm.hash);
     Object.defineProperty(k, "type", { value: type, enumerable: true });
     Object.defineProperty(k, "extractable", { value: !!extractable, enumerable: true });
-    Object.defineProperty(k, "algorithm", { value: algorithm, enumerable: true });
+    Object.defineProperty(k, "algorithm", { value: publicAlgorithm, enumerable: true });
     Object.defineProperty(k, "usages", { value: Object.freeze((usages || []).slice()), enumerable: true });
-    keyMaterial.set(k, bytes);
+    keyMaterial.set(k, {bytes, algorithm, usages: k.usages});
     return k;
   }
-  function keyBytes(key) {
+  function keyBytes(key, algorithm, usage) {
     if (!(key instanceof CryptoKey) || !keyMaterial.has(key)) {
       throw new DOMException("Argument is not a valid CryptoKey", "InvalidAccessError");
     }
-    return keyMaterial.get(key);
+    const material = keyMaterial.get(key);
+    if (usage && algorithm !== "AES-KW" && algorithm !== "AES-GCM" && algorithm !== "AES-CBC" && algorithm !== "AES-CTR") {
+      throw new DOMException("Unsupported key wrapping algorithm: " + algorithm, "NotSupportedError");
+    }
+    if (usage && (material.algorithm.name !== algorithm || !material.usages.includes(usage))) {
+      throw new DOMException("Key does not allow " + usage + " with " + algorithm, "InvalidAccessError");
+    }
+    return material.bytes;
   }
   _idbPlatformCodecs.push({
     name:"CryptoKey", test:key => keyMaterial.has(key),
-    encode:key => ({type:key.type,extractable:key.extractable,algorithm:key.algorithm,usages:key.usages,bytes:keyBytes(key)}),
+    encode:key => ({type:key.type,extractable:key.extractable,...keyMaterial.get(key)}),
     decode:data => makeKey(data.type,data.extractable,data.algorithm,data.usages,data.bytes),
   });
   // A CryptoKey cloned via structuredClone or postMessage is a different
@@ -16879,7 +16888,9 @@ if (!globalThis.crypto.subtle) {
   // material is registered once), matching structuredClone's identity rules.
   globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
     if (seen && seen.has(src)) return seen.get(src);
-    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    const bytes = keyBytes(src);
+    const material = keyMaterial.get(src);
+    const copy = makeKey(src.type, src.extractable, material.algorithm, material.usages, bytes);
     if (seen) seen.set(src, copy);
     return copy;
   };
@@ -16936,6 +16947,16 @@ if (!globalThis.crypto.subtle) {
     }
   }
 
+  // The JWK `alg` of an AES or HMAC key, or undefined for the others.
+  function jwkAlg(key, bytes) {
+    const algorithm = keyMaterial.get(key).algorithm;
+    if (algorithm.name && algorithm.name.indexOf("AES-") === 0) {
+      return "A" + (bytes.length * 8) + algorithm.name.slice(4);
+    }
+    if (algorithm.name === "HMAC") return "HS" + algorithm.hash.name.slice(4);
+    return undefined;
+  }
+
   function keyAlgorithmFor(alg, bytes) {
     switch (alg.name) {
       case "HMAC":
@@ -16983,12 +17004,14 @@ if (!globalThis.crypto.subtle) {
       if (!key.extractable) throw new DOMException("Key is not extractable", "InvalidAccessError");
       if (format === "raw") return bufferOf(bytes);
       if (format === "jwk") {
-        const jwk = { kty: "oct", k: bytesToB64url(bytes), ext: key.extractable, key_ops: key.usages.slice() };
-        if (key.algorithm.name && key.algorithm.name.indexOf("AES-") === 0) {
-          jwk.alg = "A" + (bytes.length * 8) + key.algorithm.name.slice(4);
-        } else if (key.algorithm.name === "HMAC") {
-          jwk.alg = "HS" + key.algorithm.hash.name.slice(4);
-        }
+        // Members in lexicographic order, as browsers return a JsonWebKey and
+        // as wrapKey serializes it.
+        const alg = jwkAlg(key, bytes);
+        const jwk = alg ? { alg } : {};
+        jwk.ext = key.extractable;
+        jwk.k = bytesToB64url(bytes);
+        jwk.key_ops = key.usages.slice();
+        jwk.kty = "oct";
         return jwk;
       }
       throw new DOMException("Only 'raw' and 'jwk' export is supported", "NotSupportedError");
@@ -17077,18 +17100,43 @@ if (!globalThis.crypto.subtle) {
     },
 
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+      const alg = normalizeAlgo(wrapAlgorithm);
+      const wrappingBytes = keyBytes(wrappingKey, alg.name, "wrapKey");
       const exported = await this.exportKey(format, key);
-      const bytes = format === "jwk"
-        ? new TextEncoder().encode(JSON.stringify(exported))
-        : new Uint8Array(exported);
+      // A JWK is serialized natively rather than with the page's JSON.stringify,
+      // so a toJSON or another prototype override can't change the wrapped bytes.
+      let bytes;
+      if (format === "jwk") {
+        const material = keyBytes(key);
+        bytes = __obscuraCore.ops.op_subtle_jwk_json(
+          jwkAlg(key, material) || "", key.extractable, bytesToB64url(material), key.usages.map(String));
+      } else {
+        bytes = new Uint8Array(exported);
+      }
+      // AES-KW has no encrypt, only its key wrap.
+      if (alg.name === "AES-KW") {
+        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_aes_kw(true, wrappingBytes, bytes)));
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, bytes);
     },
 
     async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
-      const decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
-      const keyData = format === "jwk"
-        ? JSON.parse(new TextDecoder().decode(new Uint8Array(decrypted)))
-        : decrypted;
+      const alg = normalizeAlgo(unwrapAlgorithm);
+      const unwrappingBytes = keyBytes(unwrappingKey, alg.name, "unwrapKey");
+      const decrypted = alg.name === "AES-KW"
+        ? runOp(() => __obscuraCore.ops.op_subtle_aes_kw(false, unwrappingBytes, toBytes(wrappedKey)))
+        : new Uint8Array(await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey));
+      let keyData;
+      if (format === "jwk") {
+        // Parsed natively too, not with the page's JSON.parse.
+        try {
+          keyData = __obscuraCore.ops.op_subtle_jwk_parse(decrypted);
+        } catch (e) {
+          throw new DOMException("The unwrapped key is not a JSON Web Key", "DataError");
+        }
+      } else {
+        keyData = bufferOf(decrypted);
+      }
       return this.importKey(format, keyData, unwrappedKeyAlgorithm, extractable, keyUsages);
     },
   };
