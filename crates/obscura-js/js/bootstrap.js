@@ -4583,7 +4583,7 @@ class Element extends Node {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+        if (href && !href.startsWith('javascript:')) {
           location.assign(href);
           return;
         }
@@ -6281,7 +6281,7 @@ class Document extends Node {
   get location() { return this._detached ? null : globalThis.location; }
   set location(url) {
     if (this._detached) return;
-    __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', '');
+    __locationNavigate(String(url), false);
   }
   get defaultView() {
     if (this._detached) return null;
@@ -7661,26 +7661,70 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
 }
+// HTML "navigate": a target that has a fragment and otherwise equals the
+// current URL is a same-document fragment navigation. It must not load a new
+// document; the history IIFE below adds (or replaces) a session-history entry
+// and queues hashchange. Hash routers (`location.hash = '#/route'`,
+// `<a href="#tab">`) depend on this.
+function __stripFragment(url) {
+  var i = url.indexOf('#');
+  return i < 0 ? url : url.slice(0, i);
+}
+function __locationNavigate(url, replace) {
+  var r = _resolveUrl(url);
+  var target = r;
+  try { target = new URL(r).href; } catch (e) {}
+  var current = __currentUrl();
+  if (target.indexOf('#') >= 0 && __stripFragment(target) === __stripFragment(current) &&
+      typeof globalThis.__obscuraNavigateToFragment === 'function') {
+    globalThis.__obscuraNavigateToFragment(target, replace);
+    return;
+  }
+  globalThis.__virtualUrl = r;
+  __obscuraCore.ops.op_navigate(r, 'GET', '');
+}
+// Location setters (HTML spec): change one component of a copy of the current
+// URL, then navigate to it. Only the fragment setter can stay in-document.
+function __locationSetPart(part, value) {
+  var u;
+  try { u = new URL(__currentUrl()); } catch (e) { return; }
+  if (part === 'hash') {
+    var previousHash = u.hash;
+    var input = String(value);
+    u.hash = input === '' ? '#' : input;
+    if (u.hash === previousHash) return;
+    __locationNavigate(u.href, false);
+    return;
+  }
+  u[part] = String(value);
+  __locationNavigate(u.href, false);
+}
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { __locationNavigate(url, false); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
+  set host(v) { __locationSetPart('host', v); },
   get hostname() { try { return new URL(this.href).hostname; } catch { return ""; } },
+  set hostname(v) { __locationSetPart('hostname', v); },
   get pathname() { try { return new URL(this.href).pathname; } catch { return "/"; } },
+  set pathname(v) { __locationSetPart('pathname', v); },
   get search() { try { return new URL(this.href).search; } catch { return ""; } },
+  set search(v) { __locationSetPart('search', v); },
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
+  set hash(v) { __locationSetPart('hash', v); },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
+  set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { __locationNavigate(url, false); },
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set(url) { __locationNavigate(String(url), false); },
   configurable: false,
   enumerable: true,
 });
@@ -13140,6 +13184,31 @@ globalThis.atob = globalThis.atob || ((s) => {
     const entry = stack[idx];
     globalThis.__virtualUrl = entry.url ?? null;
   };
+  // Same-document fragment navigation, reached from the Location setters and
+  // `<a href="#x">` activation. Per the HTML spec it adds a history entry
+  // (or replaces the current one), keeps the document, and queues a
+  // hashchange task when the fragment changed. No popstate fires here.
+  Object.defineProperty(globalThis, "__obscuraNavigateToFragment", {
+    value: (url, replace) => {
+      const prevUrl = __currentUrl();
+      if (prevUrl === url) return;
+      if (replace) {
+        stack[idx] = {state: null, url};
+      } else {
+        stack.length = idx + 1;
+        stack.push({state: null, url});
+        idx = stack.length - 1;
+        forwardCleared = true;
+      }
+      applyVirtual();
+      setTimeout(() => {
+        const ev = new HashChangeEvent('hashchange');
+        ev.oldURL = prevUrl; ev.newURL = url;
+        try { globalThis.dispatchEvent(ev); } catch {}
+      }, 0);
+    },
+    configurable: true,
+  });
   const fireHashChangeIfNeeded = (prevUrl) => {
     try {
       const next = __currentUrl();
