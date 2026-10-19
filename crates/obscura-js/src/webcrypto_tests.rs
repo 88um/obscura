@@ -98,3 +98,92 @@ async fn wrapped_jwks_ignore_the_pages_json() {
         "DataError",
     ]));
 }
+
+#[tokio::test]
+async fn key_wrapping_checks_the_wrapping_keys_algorithm_and_usage() {
+    let out = probe(r#"
+        const bytes = new Uint8Array(16);
+        const payload = await s.importKey('raw', bytes, 'AES-GCM', true, ['encrypt']);
+        const results = [];
+        for (const name of ['AES-KW', 'AES-GCM', 'AES-CBC', 'AES-CTR']) {
+            const alg = name === 'AES-GCM' ? {name, iv: new Uint8Array(12)}
+                : name === 'AES-CBC' ? {name, iv: new Uint8Array(16)}
+                : name === 'AES-CTR' ? {name, counter: new Uint8Array(16), length: 64} : name;
+            const unwrapOnly = await s.importKey('raw', bytes, name, false, ['unwrapKey']);
+            const wrongAlgorithm = await s.importKey('raw', bytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+            results.push(await errorName(() => s.wrapKey('raw', payload, unwrapOnly, alg)));
+            results.push(await errorName(() => s.wrapKey('raw', payload, wrongAlgorithm, alg)));
+            wrongAlgorithm.algorithm.name = name;
+            results.push(await errorName(() => s.wrapKey('raw', payload, wrongAlgorithm, alg)));
+            const wrapOnly = await s.importKey('raw', bytes, name, false, ['wrapKey']);
+            wrapOnly.algorithm.name = 'HMAC';
+            results.push((await s.wrapKey('raw', payload, wrapOnly, alg)).byteLength > 0);
+        }
+        return results;
+    "#).await;
+    assert_eq!(out, json!([
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
+    ]));
+}
+
+#[tokio::test]
+async fn key_unwrapping_checks_the_unwrapping_keys_algorithm_and_usage() {
+    let out = probe(r#"
+        const bytes = new Uint8Array(16);
+        const payload = await s.importKey('raw', bytes, 'AES-GCM', true, ['encrypt']);
+        const results = [];
+        for (const name of ['AES-KW', 'AES-GCM', 'AES-CBC', 'AES-CTR']) {
+            const alg = name === 'AES-GCM' ? {name, iv: new Uint8Array(12)}
+                : name === 'AES-CBC' ? {name, iv: new Uint8Array(16)}
+                : name === 'AES-CTR' ? {name, counter: new Uint8Array(16), length: 64} : name;
+            const wrapOnly = await s.importKey('raw', bytes, name, false, ['wrapKey']);
+            const wrapped = await s.wrapKey('raw', payload, wrapOnly, alg);
+            const wrongAlgorithm = await s.importKey('raw', bytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+            const unwrap = key => s.unwrapKey('raw', wrapped, key, alg, 'AES-GCM', true, ['encrypt']);
+            results.push(await errorName(() => unwrap(wrapOnly)));
+            results.push(await errorName(() => unwrap(wrongAlgorithm)));
+            wrongAlgorithm.algorithm.name = name;
+            results.push(await errorName(() => unwrap(wrongAlgorithm)));
+            const unwrapOnly = await s.importKey('raw', bytes, name, false, ['unwrapKey']);
+            unwrapOnly.algorithm.name = 'HMAC';
+            const restored = await unwrap(unwrapOnly);
+            results.push(hex(await s.exportKey('raw', restored)));
+        }
+        return results;
+    "#).await;
+    assert_eq!(out, json!([
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
+        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
+    ]));
+}
+
+#[tokio::test]
+async fn unsupported_wrapping_algorithms_still_report_not_supported() {
+    let out = probe(r#"
+        const key = await s.importKey('raw', new Uint8Array(16), {name:'HMAC', hash:'SHA-256'}, true, ['sign']);
+        return [
+            await errorName(() => s.wrapKey('raw', key, key, 'HMAC')),
+            await errorName(() => s.unwrapKey('raw', new Uint8Array(24), key, 'HMAC', 'AES-GCM', false, ['encrypt'])),
+        ];
+    "#).await;
+    assert_eq!(out, json!(["NotSupportedError", "NotSupportedError"]));
+}
+
+#[tokio::test]
+async fn cloned_wrapping_keys_keep_their_internal_algorithm() {
+    let out = probe(r#"
+        const key = await s.importKey('raw', new Uint8Array(16), 'AES-KW', false, ['wrapKey', 'unwrapKey']);
+        key.algorithm.name = 'HMAC';
+        const copy = structuredClone({first:key, second:key});
+        const payload = await s.importKey('raw', new Uint8Array(16), 'AES-GCM', true, ['encrypt']);
+        const wrapped = await s.wrapKey('raw', payload, copy.first, 'AES-KW');
+        const restored = await s.unwrapKey('raw', wrapped, copy.first, 'AES-KW', 'AES-GCM', true, ['encrypt']);
+        return [copy.first.algorithm.name, copy.first === copy.second, hex(await s.exportKey('raw', restored))];
+    "#).await;
+    assert_eq!(out, json!(["AES-KW", true, "00000000000000000000000000000000"]));
+}
