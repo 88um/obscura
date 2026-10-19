@@ -3488,6 +3488,33 @@ const _forwardingLabels = new WeakSet();
 // __obscura_markTrusted already does for any event.
 const _TRUSTED_ACTIVATION = Symbol('obscura.trustedActivation');
 
+const _pendingDetailsToggles = new WeakMap();
+globalThis.__obscura_activateSummary = function(target) {
+  const summary = target.tagName === 'SUMMARY' ? target : target.closest?.('summary');
+  if (!summary || summary.parentElement?.tagName !== 'DETAILS') return false;
+  const interactive = target.closest?.(_INTERACTIVE);
+  if (interactive && summary.contains(interactive)) return false;
+  const details = summary.parentElement;
+  let firstSummary = details.firstElementChild;
+  while (firstSummary && firstSummary.tagName !== 'SUMMARY') firstSummary = firstSummary.nextElementSibling;
+  if (firstSummary !== summary) return false;
+  const oldState = details.open ? 'open' : 'closed';
+  const newState = details.open ? 'closed' : 'open';
+  details.open = !details.open;
+  const pending = _pendingDetailsToggles.get(details);
+  if (pending) {
+    pending.newState = newState;
+  } else {
+    const states = {oldState, newState};
+    _pendingDetailsToggles.set(details, states);
+    setTimeout(() => {
+      _pendingDetailsToggles.delete(details);
+      details.dispatchEvent(new ToggleEvent('toggle', states));
+    }, 0);
+  }
+  return true;
+};
+
 // Only these elements can be actually disabled. A `disabled` attribute on
 // anything else, which component libraries do put on plain <div>s, has no
 // effect on event dispatch.
@@ -4579,6 +4606,7 @@ class Element extends Node {
         return;
       }
     }
+    if (globalThis.__obscura_activateSummary(this)) return;
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {

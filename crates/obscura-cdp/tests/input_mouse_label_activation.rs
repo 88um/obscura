@@ -17,13 +17,14 @@ async fn serve_fixture() -> String {
         // regardless of inline-wrapper geometry.
         let body = r#"<!doctype html><html><head><style>
             html, body { margin: 0; font: 16px monospace }
-            label { display: block; width: 200px; height: 40px }
+            label, summary { display: block; width: 200px; height: 40px }
         </style></head><body>
           <label id="explicit" for="boxa">a</label><input id="boxa" type="checkbox">
           <label id="implicit">b <input id="boxb" type="checkbox"></label>
           <label id="deep" for="boxc"><span><b id="deep-text">c</b></span></label>
           <input id="boxc" type="checkbox">
           <label id="off" for="boxd">d</label><input id="boxd" type="checkbox" disabled>
+          <details id="panel"><summary id="summary">More</summary><p>Content</p></details>
           <script>
             window.events = [];
             for (const id of ['boxa','boxb','boxc','boxd']) {
@@ -137,6 +138,17 @@ async fn mouse_click_on_a_label_activates_its_control() {
          boxb:click:true,boxb:input:true,boxb:change:true",
         "each control fires click, input, change once, in order: {state}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_click_on_summary_toggles_details() {
+    let (mut ctx, sid) = setup().await;
+    click_element(&mut ctx, 40, &sid, "#summary").await;
+    let open = evaluate(&mut ctx, 50, "document.getElementById('panel').open", &sid).await;
+    assert_eq!(open["result"]["value"], true);
+    click_element(&mut ctx, 60, &sid, "#summary").await;
+    let closed = evaluate(&mut ctx, 70, "document.getElementById('panel').open", &sid).await;
+    assert_eq!(closed["result"]["value"], false);
 }
 
 #[tokio::test(flavor = "current_thread")]

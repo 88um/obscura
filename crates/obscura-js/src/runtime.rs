@@ -18725,6 +18725,49 @@ mod tests {
         assert_eq!(result, serde_json::json!("yes"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_summary_activation_toggles_details() {
+        let mut rt = setup_runtime(
+            r#"<details id="panel"><summary id="first"><span id="text">More</span><button id="nested">Button</button></summary>
+               <summary id="second">Other</summary><p>Content</p></details>
+               <details id="cancel"><summary id="blocked">Blocked</summary></details>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const panel = document.getElementById('panel');
+            const cancel = document.getElementById('cancel');
+            globalThis.summaryToggles = [];
+            panel.addEventListener('toggle', event => summaryToggles.push([event.oldState, event.newState]));
+            document.getElementById('text').click();
+            const opened = panel.open;
+            document.getElementById('second').click();
+            const stillOpen = panel.open;
+            document.getElementById('first').click();
+            const closed = panel.open;
+            document.getElementById('nested').click();
+            const afterNested = panel.open;
+            document.getElementById('blocked').addEventListener('click', event => event.preventDefault());
+            document.getElementById('blocked').click();
+            return [opened, stillOpen, closed, afterNested, cancel.open, summaryToggles.length];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false, false, false, 0]));
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("summaryToggles").unwrap(),
+            serde_json::json!([["closed", "closed"]])
+        );
+        rt.evaluate("document.getElementById('first').click()")
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("summaryToggles").unwrap(),
+            serde_json::json!([["closed", "closed"], ["closed", "open"]])
+        );
+    }
+
     #[test]
     fn test_label_click_activates_its_labeled_control() {
         let mut rt = setup_runtime(
