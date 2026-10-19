@@ -7677,7 +7677,7 @@ function __locationNavigate(url, replace) {
   var current = __currentUrl();
   if (target.indexOf('#') >= 0 && __stripFragment(target) === __stripFragment(current) &&
       typeof globalThis.__obscuraNavigateToFragment === 'function') {
-    globalThis.__obscuraNavigateToFragment(target, replace || target === current);
+    globalThis.__obscuraNavigateToFragment(target, replace);
     return;
   }
   globalThis.__virtualUrl = r;
@@ -7689,15 +7689,11 @@ function __locationSetPart(part, value) {
   var u;
   try { u = new URL(__currentUrl()); } catch (e) { return; }
   if (part === 'hash') {
-    var current = u.href;
+    var previousHash = u.hash;
     var input = String(value);
-    if (input.startsWith('#')) input = input.slice(1);
-    u.hash = input;
-    var next = input === '' ? __stripFragment(current) + '#' : u.href;
-    var oldFragment = current.indexOf('#') >= 0 ? current.slice(current.indexOf('#')) : null;
-    var newFragment = next.slice(next.indexOf('#'));
-    if (oldFragment === newFragment) return;
-    __locationNavigate(next, false);
+    u.hash = input === '' ? '#' : input;
+    if (u.hash === previousHash) return;
+    __locationNavigate(u.href, false);
     return;
   }
   u[part] = String(value);
@@ -13195,6 +13191,7 @@ globalThis.atob = globalThis.atob || ((s) => {
   Object.defineProperty(globalThis, "__obscuraNavigateToFragment", {
     value: (url, replace) => {
       const prevUrl = __currentUrl();
+      if (prevUrl === url) return;
       if (replace) {
         stack[idx] = {state: null, url};
       } else {
@@ -13204,7 +13201,6 @@ globalThis.atob = globalThis.atob || ((s) => {
         forwardCleared = true;
       }
       applyVirtual();
-      if (prevUrl === url) return;
       setTimeout(() => {
         const ev = new HashChangeEvent('hashchange');
         ev.oldURL = prevUrl; ev.newURL = url;

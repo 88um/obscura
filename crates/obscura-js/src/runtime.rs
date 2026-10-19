@@ -7001,6 +7001,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_preserves_leading_hashes_and_ignores_an_unchanged_empty_fragment() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("hash-setter", r#"
+            globalThis.__hashEvents = [];
+            addEventListener('hashchange', e => __hashEvents.push([e.oldURL, e.newURL]));
+            location.hash = '';
+            location.hash = '#';
+            globalThis.__emptyHashResult = [location.href, history.length];
+            location.hash = '##panel';
+            location.hash = '##panel';
+        "#).unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__emptyHashResult, location.href, location.hash, history.length, __hashEvents]").unwrap(),
+            serde_json::json!([
+                ["http://example.com/test", 1],
+                "http://example.com/test##panel", "##panel", 2,
+                [["http://example.com/test", "http://example.com/test##panel"]],
+            ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_fragment_navigation_preserves_history_state() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#panel'>tab</a></body></html>");
+        rt.execute_script("same-fragment", r#"
+            history.replaceState({saved: 1}, '', '#panel');
+            globalThis.__sameHashEvents = 0;
+            addEventListener('hashchange', () => __sameHashEvents++);
+            location.assign('#panel');
+            location.href = '#panel';
+            location.replace('#panel');
+            document.getElementById('tab').click();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(rt.evaluate("[history.state, history.length, location.hash, __sameHashEvents]").unwrap(),
+            serde_json::json!([{ "saved": 1 }, 1, "#panel", 0]));
+    }
+
     #[test]
     fn push_state_without_url_preserves_current_location() {
         let mut rt = setup_runtime("<html><body></body></html>");
