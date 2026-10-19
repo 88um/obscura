@@ -86,13 +86,13 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">
+      <a href="https://go.nodemaven.com/obscurareadmeoctober" target="_blank">
         <img alt="NodeMaven" src="assets/sponsors/nodemaven3.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
-      <b>Why <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">NodeMaven</a>?</b><br>
+      <a href="https://go.nodemaven.com/obscurareadmeoctober" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscurareadmeoctober" target="_blank">NodeMaven</a>?</b><br>
       ZIP targeting<br>
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
@@ -102,25 +102,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
       <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
     </td>
- <tr>
-  <td width="200" align="center" valign="middle">
-    <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
-      <img alt="ProxyEmpire" src="assets/sponsors/proxyempire.png" width="180"/>
-    </a>
-  </td>
-  <td valign="middle">
-    🚀 <b>Obscura × ProxyEmpire</b><br>
-    Using Obscura for AI agents, browser automation, or web scraping? Power it with reliable residential and mobile proxies from <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub"><b>ProxyEmpire</b></a>.<br><br>
-    <b>
-      🌍 30M+ residential IPs in 170+ countries<br>
-      📱 4G/5G mobile proxies<br>
-      🔄 Rotating & sticky sessions<br>
-      🎯 City, region & ISP targeting<br>
-      🔐 HTTP, HTTPS & SOCKS5 support<br><br>
-      🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br>
-    </b>
-    Better proxies. Fewer blocks. More scalable automation.
-  </td>
     <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://masklabs.io" target="_blank">
