@@ -11317,9 +11317,13 @@ where
 /// Collect rows together with the exclusive end of their originating row
 /// group. HTML rowspans never cross a thead/tbody/tfoot boundary; `rowspan=0`
 /// means the remainder of that group, not the remainder of the whole table.
-fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)>) {
+fn collect_table_rows(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>,
+    rows: &mut Vec<(NodeId, usize)>) {
     let mut direct_start: Option<usize> = None;
     for cid in tree.children(id) {
+        if styles.get(&cid).is_some_and(|style| style.display == crate::Display::None) {
+            continue;
+        }
         let local = tree
             .borrow_node(cid)
             .and_then(|n| n.as_element().map(|e| e.local.to_string()));
@@ -11337,7 +11341,8 @@ fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)
                 }
                 let start = rows.len();
                 for row in tree.children(cid) {
-                    if tree.borrow_node(row).is_some_and(|node| {
+                    if !styles.get(&row).is_some_and(|style| style.display == crate::Display::None)
+                        && tree.borrow_node(row).is_some_and(|node| {
                         node.as_element()
                             .is_some_and(|element| element.local.as_ref() == "tr")
                     }) {
@@ -11713,7 +11718,7 @@ fn build_table(
     };
     let mut rows: Vec<(NodeId, usize)> = Vec::new();
     if native_html_table {
-        collect_table_rows(tree, id, &mut rows);
+        collect_table_rows(tree, id, styles, &mut rows);
         if rows.is_empty() {
             return None;
         }
