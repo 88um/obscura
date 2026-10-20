@@ -326,6 +326,51 @@ fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
     );
 }
 
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_rows_do_not_generate_cells_tracks_or_rowspan_slots() {
+    let tree = parse_html(r#"<style>
+        html,body{margin:0}table{border-spacing:0}td{width:30px;height:20px;padding:0}
+        .gone{display:none}.wide{width:500px;height:90px}
+        </style><table id="table"><tbody>
+        <tr><td id="span" rowspan="2"></td><td></td></tr>
+        <tr class="gone" id="gone"><td class="wide" id="gone-cell"></td></tr>
+        <tr><td id="next"></td></tr><tr><td id="last"></td></tr>
+        </tbody></table>"#);
+    let layout = layout_dom(&tree, (600.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["gone", "gone-cell"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+            "hidden {id} generated a box");
+    }
+    assert_eq!((rect("table").width, rect("table").height), (60.0, 60.0));
+    assert_eq!(rect("span").height, 40.0);
+    assert_eq!((rect("next").x, rect("next").y), (30.0, 20.0));
+    assert_eq!((rect("last").x, rect("last").y), (0.0, 40.0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_sections_do_not_contribute_rows_or_cell_widths() {
+    for section in ["thead", "tbody", "tfoot"] {
+        let tree = parse_html(&format!(r#"<style>
+            html,body{{margin:0}}table{{border-spacing:0}}td{{width:30px;height:20px;padding:0}}
+            </style><table id="table"><{section} id="gone" style="display:none">
+            <tr id="gone-row"><td id="gone-cell" style="width:500px;height:90px;visibility:visible"></td></tr>
+            </{section}><tbody><tr style="visibility:hidden"><td id="invisible"></td></tr>
+            <tr><td id="visible"></td></tr></tbody></table>"#));
+        let layout = layout_dom(&tree, (600.0, 400.0));
+        for id in ["gone", "gone-row", "gone-cell"] {
+            assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+                "display:none {section} generated a box for {id}");
+        }
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!((rect("table").width, rect("table").height), (30.0, 40.0));
+        assert_eq!(rect("invisible").height, 20.0, "visibility:hidden must retain its track");
+        assert_eq!(rect("visible").y, 20.0);
+    }
+}
+
 #[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(
