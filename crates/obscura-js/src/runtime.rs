@@ -6935,6 +6935,112 @@ mod tests {
         assert_eq!(path, serde_json::json!("/dashboard"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_navigates_to_a_fragment_in_the_same_document() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#tab'>tab</a></body></html>");
+        rt.execute_script(
+            "fragment-navigation",
+            r#"
+                globalThis.__events = [];
+                addEventListener('hashchange', (e) => __events.push(e.oldURL + ' -> ' + e.newURL));
+                globalThis.__marker = 'same-document';
+                location.hash = 'one';
+                globalThis.__syncHash = location.hash;
+                location.hash = '#one';
+                location.href = '#two';
+                document.getElementById('tab').click();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(rt.take_pending_navigation(), None, "a fragment change must not load a new document");
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate("[__syncHash, location.href, history.length, __marker, __events]")
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "#one",
+                "http://example.com/test#tab",
+                4,
+                "same-document",
+                [
+                    "http://example.com/test -> http://example.com/test#one",
+                    "http://example.com/test#one -> http://example.com/test#two",
+                    "http://example.com/test#two -> http://example.com/test#tab",
+                ],
+            ])
+        );
+        rt.evaluate("history.back()").unwrap();
+        assert_eq!(rt.evaluate("location.hash").unwrap(), serde_json::json!("#two"));
+    }
+
+    #[test]
+    fn location_replace_with_a_fragment_replaces_the_history_entry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("(function(){ location.replace('#r'); return [location.hash, history.length]; })()")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["#r", 1]));
+        assert_eq!(rt.take_pending_navigation(), None);
+    }
+
+    #[test]
+    fn location_component_setters_load_the_new_url() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.search = 'q=1'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/test?q=1".into(), "GET".into(), String::new())),
+        );
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.pathname = '/other'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation().map(|(url, _, _)| url),
+            Some("http://example.com/other".into()),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_preserves_leading_hashes_and_ignores_an_unchanged_empty_fragment() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("hash-setter", r#"
+            globalThis.__hashEvents = [];
+            addEventListener('hashchange', e => __hashEvents.push([e.oldURL, e.newURL]));
+            location.hash = '';
+            location.hash = '#';
+            globalThis.__emptyHashResult = [location.href, history.length];
+            location.hash = '##panel';
+            location.hash = '##panel';
+        "#).unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__emptyHashResult, location.href, location.hash, history.length, __hashEvents]").unwrap(),
+            serde_json::json!([
+                ["http://example.com/test", 1],
+                "http://example.com/test##panel", "##panel", 2,
+                [["http://example.com/test", "http://example.com/test##panel"]],
+            ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_fragment_navigation_preserves_history_state() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#panel'>tab</a></body></html>");
+        rt.execute_script("same-fragment", r#"
+            history.replaceState({saved: 1}, '', '#panel');
+            globalThis.__sameHashEvents = 0;
+            addEventListener('hashchange', () => __sameHashEvents++);
+            location.assign('#panel');
+            location.href = '#panel';
+            location.replace('#panel');
+            document.getElementById('tab').click();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(rt.evaluate("[history.state, history.length, location.hash, __sameHashEvents]").unwrap(),
+            serde_json::json!([{ "saved": 1 }, 1, "#panel", 0]));
+    }
+
     #[test]
     fn push_state_without_url_preserves_current_location() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -9394,6 +9500,105 @@ mod tests {
         assert_eq!(result, serde_json::json!([
             true, true, true, true,
             [false, false, false, false, false, false]
+        ]));
+    }
+
+    #[test]
+    fn list_element_brands_survive_parsing_creation_and_cloning() {
+        let mut rt = setup_runtime("<html><body><ol><li>item</li></ol></body></html>");
+        let result = rt.evaluate(r#"
+            return [['ol', HTMLOListElement], ['li', HTMLLIElement]].map(([tag, C]) => {
+                const parsed = document.querySelector(tag);
+                const created = document.createElement(tag);
+                const nodes = [parsed, created, parsed.cloneNode(true), created.cloneNode(),
+                    document.importNode(parsed, true)];
+                return [nodes.map(node => node instanceof C && node instanceof HTMLElement
+                    && node.constructor === C), Object.prototype.toString.call(created),
+                    [document.createElement('div'), document.createElement('ul'),
+                        document.createElementNS('urn:test', tag),
+                        document.createElementNS('urn:test', tag.toUpperCase()).cloneNode(),
+                        document.createElementNS('http://www.w3.org/2000/svg', tag)]
+                        .map(node => node instanceof C)];
+            });
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[true, true, true, true, true], "[object HTMLOListElement]",
+                [false, false, false, false, false]],
+            [[true, true, true, true, true], "[object HTMLLIElement]",
+                [false, false, false, false, false]]
+        ]));
+    }
+
+    #[test]
+    fn list_element_properties_reflect_boolean_and_string_attributes() {
+        let mut rt = setup_runtime(
+            "<html><body><ol reversed start='-2' type='A'><li value='-4'>item</li></ol></body></html>",
+        );
+        let result = rt.evaluate(r#"
+            const parsed = document.querySelector('ol');
+            const list = document.createElement('ol');
+            const initial = [parsed.reversed, parsed.start, parsed.type,
+                document.querySelector('li').value, list.reversed, list.start, list.type];
+            const states = [];
+            list.reversed = true;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.reversed = false;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.setAttribute('reversed', 'false');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.removeAttribute('reversed');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.type = 'i';
+            const written = [list.type, list.getAttribute('type')];
+            list.setAttribute('type', 'invalid');
+            const changed = list.type;
+            list.removeAttribute('type');
+            const removed = list.type;
+            list.type = null;
+            return [initial, states, written, changed, removed, list.getAttribute('type'),
+                'reversed' in document.createElement('div'),
+                'start' in document.createElement('li'),
+                ['reversed', 'start', 'type'].every(name =>
+                    Object.getOwnPropertyDescriptor(HTMLOListElement.prototype, name)?.enumerable),
+                Object.getOwnPropertyDescriptor(HTMLLIElement.prototype, 'value')?.enumerable];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, -2, "A", -4, false, 1, ""],
+            [[true, ""], [false, null], [true, "false"], [false, null]],
+            ["i", "i"], "invalid", "", "null", false, false,
+            true, true
+        ]));
+    }
+
+    #[test]
+    fn list_element_integer_reflection_defaults_parses_and_wraps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const list = document.createElement('ol');
+            const item = document.createElement('li');
+            const attributes = [null, '', 'invalid', '  +12tail', '-3.8',
+                '2147483648', '-2147483649', '99999999999999999999', '0x10'].map(value => {
+                if (value === null) { list.removeAttribute('start'); item.removeAttribute('value'); }
+                else { list.setAttribute('start', value); item.setAttribute('value', value); }
+                return [list.start, item.value];
+            });
+            const setters = [4294967297, 2147483648, -2147483649, NaN, Infinity,
+                -0, 3.8, null].map(value => {
+                list.start = value;
+                item.value = value;
+                return [list.start, list.getAttribute('start'), item.value, item.getAttribute('value')];
+            });
+            const bigints = [[list, 'start'], [item, 'value'], [list, 'tabIndex']].map(([node, key]) => {
+                try { node[key] = 1n; return 'accepted'; } catch (error) { return error.name; }
+            });
+            return [attributes, setters, bigints];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[1, 0], [1, 0], [1, 0], [12, 12], [-3, -3], [1, 0], [1, 0], [1, 0], [0, 0]],
+            [[1, "1", 1, "1"], [-2147483648i64, "-2147483648", -2147483648i64, "-2147483648"],
+                [2147483647, "2147483647", 2147483647, "2147483647"], [0, "0", 0, "0"],
+                [0, "0", 0, "0"], [0, "0", 0, "0"], [3, "3", 3, "3"], [0, "0", 0, "0"]],
+            ["TypeError", "TypeError", "TypeError"]
         ]));
     }
 
@@ -24561,9 +24766,7 @@ mod tests {
 
     /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
     /// input event. If the method isn't defined Playwright retries until its
-    /// action timeout fires. Without a layout engine we can't compute it
-    /// properly, so the stub always returns true — still strictly better
-    /// than the undefined path.
+    /// action timeout fires, so it must exist and be true for plain elements.
     #[test]
     fn element_check_visibility_is_callable() {
         let mut rt = setup_runtime(r#"<div id="x">x</div>"#);
@@ -24576,6 +24779,84 @@ mod tests {
             .evaluate("typeof document.getElementById('x').checkVisibility")
             .unwrap();
         assert_eq!(typeof_method, serde_json::json!("function"));
+    }
+
+    /// Issue #1067: checkVisibility() follows the CSSOM View algorithm:
+    /// elements without a box (display:none on self or an ancestor,
+    /// display:contents, disconnected) are hidden, and the opacity /
+    /// visibility options are honored, including their legacy aliases.
+    #[test]
+    fn element_check_visibility_follows_css_boxes_and_options() {
+        let mut rt = setup_runtime(
+            r#"
+            <div style="display:none"><a id="a" href="/x">hidden</a></div>
+            <div style="visibility:hidden"><a id="b" href="/x">invisible</a></div>
+            <div style="opacity:0"><span id="c">transparent</span></div>
+            <span id="e" style="display:contents">contents</span>
+            <span id="f" style="display:none">self none</span>
+            <div style="visibility:hidden"><span id="g" style="visibility:visible">back</span></div>
+            <a id="v" href="/x">visible</a>
+            "#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const $ = id => document.getElementById(id);
+                return [
+                  $('a').checkVisibility(),
+                  $('b').checkVisibility(),
+                  $('b').checkVisibility({visibilityProperty: true}),
+                  $('b').checkVisibility({checkVisibilityCSS: true}),
+                  $('c').checkVisibility(),
+                  $('c').checkVisibility({opacityProperty: true}),
+                  $('c').checkVisibility({checkOpacity: true}),
+                  $('e').checkVisibility(),
+                  $('f').checkVisibility(),
+                  $('g').checkVisibility({visibilityProperty: true}),
+                  $('v').checkVisibility({visibilityProperty: true, opacityProperty: true}),
+                  document.createElement('div').checkVisibility(),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, true, false, false, true, false, false, false, false, true, true, false
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_flat_tree_box_presence() {
+        let mut rt = setup_runtime(r#"<details><summary id="summary">show</summary>
+            <span id="closed">closed</span></details><div id="host"><span id="unslotted">light</span></div>
+            <div id="zero" style="width:0;height:0"></div><span id="empty"></span>
+            <table><tr id="row" style="display:none"><td>hidden</td></tr></table>"#);
+        let result = rt.evaluate(r#"(() => {
+            const root = document.getElementById('host').attachShadow({mode:'open'});
+            root.innerHTML = '<span id="shadow">shadow</span>';
+            return ['summary','closed','unslotted','zero','empty','row'].map(id =>
+                document.getElementById(id).checkVisibility()).concat(root.getElementById('shadow').checkVisibility());
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,false,false,true,true,false,true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_the_owning_frame() {
+        let mut rt = setup_runtime("<div style='display:none'><span>parent hidden</span></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<div id="shown">child</div><div id="hidden" style="display:none">hidden</div>';
+            const shown = d.getElementById('shown'), hidden = d.getElementById('hidden');
+            const parentCheck = Element.prototype.checkVisibility;
+            return [shown.checkVisibility(),hidden.checkVisibility(),
+                parentCheck.call(shown),parentCheck.call(hidden)];
+        })()"#).unwrap(), serde_json::json!([true,false,true,false]));
     }
 
     /// Playwright's `getByRole` / `getByLabel` locators resolve via ARIA
