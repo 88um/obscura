@@ -2627,117 +2627,72 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
-        // Every shape of this command now travels the same path. The
-        // by-value sync case used to short-circuit through `evaluate`,
-        // whose wrapper answers an exception with `null` — indistinguishable
-        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
-
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
-
-        // The expression travels as a *string* into an indirect eval rather
-        // than being pasted into a wrapper. Pasting forced two workarounds
-        // that only half worked: a trailing `;` had to be trimmed or
-        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
-        // (Puppeteer and Playwright both append one) would swallow the
-        // closing paren unless it sat on its own line. Neither can happen to
-        // a string literal.
-        //
-        // It also makes statements legal. `Runtime.evaluate` is specified to
-        // take a script, not an expression, so `throw new Error('x')` and
-        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
-        // first was a parse-time SyntaxError, which is not catchable, and the
-        // second returned the wrapper's own `undefined` instead of the
-        // completion value Chrome reports (#746).
-        //
-        // `(0, eval)` rather than `eval` so the script runs at global scope,
-        // where `var` lands on `globalThis` the way it does in Chrome, and
-        // cannot see this wrapper's `__result`.
-        let source_literal = serde_json::Value::String(expression.to_string());
-        let meta_code = if await_promise {
-            format!(
-                "(function() {{\n\
-                    var pending = {{done:false,rejected:false,value:undefined}};\n\
-                    (async function() {{\n\
-                        try {{ pending.value = await (0, eval)({src}); }}\n\
-                        catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
-                        pending.done = true;\n\
-                    }})();\n\
-                    return pending;\n\
-                }})()",
-                src = source_literal,
-            )
-        } else {
-            // Before this, a throw here became `__result = undefined`: the
-            // command answered successfully with `undefined`, so a page error
-            // was indistinguishable from an expression with no value.
-            format!(
-                "(function() {{\n\
-                    var __result;\n\
-                    try {{\n\
-                        __result = (0, eval)({src});\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                        return globalThis.__obscura_await_meta;\n\
-                    }}\n\
-                    globalThis.__obscura_objects[{oid}] = __result;\n\
-                    globalThis.__obscura_await_rejected = false;\n\
-                    return {meta_fn};\n\
-                }})()",
-                src = source_literal,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-            )
+        // Compile the script itself, not a string passed through the page's eval.
+        let record = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let source = v8::String::new(scope, expression).ok_or("CDP source allocation failed")?;
+            let name = v8::String::new(scope, "<eval-remote>").ok_or("CDP origin allocation failed")?;
+            let origin = v8::ScriptOrigin::new(
+                scope, name.into(), 0, 0, false, 0, None, false, false, false, None,
+            );
+            let result = v8::Script::compile(scope, source, Some(&origin))
+                .and_then(|script| script.run(scope));
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            let rejected = result.is_none();
+            let value = result.or_else(|| scope.exception())
+                .ok_or("CDP evaluation failed without an exception")?;
+            scope.reset();
+            let should_await = await_promise && !rejected;
+            let pending = v8::Object::new(scope);
+            let done = v8::Boolean::new(scope, !should_await);
+            let rejected = v8::Boolean::new(scope, rejected);
+            let initial_value = if should_await { v8::undefined(scope).into() } else { value };
+            for (name, value) in [
+                ("done", done.into()), ("rejected", rejected.into()), ("value", initial_value),
+            ] {
+                let key = v8::String::new(scope, name).ok_or("CDP result key allocation failed")?;
+                if pending.create_data_property(scope, key.into(), value) != Some(true) {
+                    return Err("CDP result allocation failed".to_string());
+                }
+            }
+            if should_await {
+                // Await assimilates thenables without consulting the page's Promise constructor.
+                let source = v8::String::new(scope, r#"(async function(value, pending) {
+                    try { pending.value = await value; }
+                    catch (error) { pending.value = error; pending.rejected = true; }
+                    pending.done = true;
+                })"#).ok_or("CDP await allocation failed")?;
+                let function = v8::Script::compile(scope, source, None)
+                    .and_then(|script| script.run(scope))
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .ok_or_else(|| exception_text(scope))?;
+                let receiver = v8::undefined(scope).into();
+                function.call(scope, receiver, &[value, pending.into()])
+                    .ok_or_else(|| exception_text(scope))?;
+            }
+            let pending: v8::Local<v8::Value> = pending.into();
+            Ok(v8::Global::new(scope, pending))
+        })();
+        let record = self.finish_heap_checked(record)?;
+        self.pending_cdp_evaluations.insert(oid.clone(), record);
+        let pending = PendingCdpEvaluation {
+            object_id: oid,
+            recipe: if return_by_value { None } else { Some(expression.to_string()) },
         };
-
-        let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
-            .map_err(|e| format!("JS error: {}", e))?;
-
         if await_promise {
-            self.pending_cdp_evaluations.insert(oid.clone(), result);
-            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid,
-                recipe: if return_by_value { None } else { Some(expression.to_string()) },
-            }));
-        }
-        let meta_str = result;
-
-        // Neither a rejection nor a synchronous throw is a protocol failure.
-        // CDP answers the command and puts the value in `exceptionDetails`,
-        // which is what a client rebuilds the page error from, so it travels
-        // back as a remote object flagged `thrown`. It is reported by
-        // reference even when the caller asked for a value:
-        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
-        // would throw the message away.
-        let thrown = self
-            .execute_runtime_script(
-                "<readRejected>",
-                "globalThis.__obscura_await_rejected".to_string(),
-            )
-            .map_err(|e| format!("JS error: {}", e))?;
-        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid).map(CdpEvaluation::Complete);
-        }
-        if return_by_value {
-            return self.take_cdp_result_by_value(&oid).map(CdpEvaluation::Complete);
-        }
-        let meta_str = self.v8_to_json(meta_str)?;
-        let meta_json = if let serde_json::Value::String(s) = &meta_str {
-            serde_json::from_str(s).unwrap_or(meta_str)
+            Ok(CdpEvaluation::Pending(pending))
         } else {
-            meta_str
-        };
-        let info = self.finish_cdp_result(&meta_json, &oid)?;
-        // The eval-based wrapper parses the expression as statements.
-        if info.object_id.is_some() {
-            self.evaluation_recipes.insert(oid, expression.to_string());
+            self.finish_cdp_evaluation(pending, return_by_value).map(CdpEvaluation::Complete)
         }
-        Ok(CdpEvaluation::Complete(info))
     }
 
     pub async fn call_function_on_for_cdp(
@@ -4590,29 +4545,6 @@ impl ObscuraJsRuntime {
                 unserializable_value: None,
             },
         }
-    }
-
-    /// Build the remote object for a value that was thrown, or that a promise
-    /// rejected with.
-    ///
-    /// Both wrappers have already stored the value under `oid` and put its
-    /// metadata in `__obscura_await_meta`, so this reads them back and marks
-    /// the result. The mark is what lets the CDP layer answer the command with
-    /// `exceptionDetails` rather than fail it or, worse, present the value as
-    /// the evaluation result.
-    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
-        let meta = self
-            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
-        let meta = self.v8_to_json(meta)?;
-        let meta_json = if let serde_json::Value::String(text) = &meta {
-            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
-        } else {
-            meta
-        };
-        let mut info = self.finish_cdp_result(&meta_json, oid)?;
-        info.thrown = true;
-        Ok(info)
     }
 
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
@@ -19141,6 +19073,30 @@ mod tests {
                 "".to_string()
             ))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_does_not_call_the_pages_eval() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.evaluate_script("globalThis.eval = () => { throw new Error('page eval called'); };").unwrap();
+        for await_promise in [false, true] {
+            let result = rt.evaluate_for_cdp("6 * 7", true, await_promise).await.unwrap();
+            assert!(!result.thrown);
+            assert_eq!(result.value, Some(serde_json::json!(42.0)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_preserves_global_lexical_bindings() {
+        let mut rt = ObscuraJsRuntime::new();
+        for (name, await_promise) in [("syncLexical", false), ("asyncLexical", true)] {
+            let declaration = format!("let {name} = 40; {name}");
+            let first = rt.evaluate_for_cdp(&declaration, true, await_promise).await.unwrap();
+            assert_eq!(first.value, Some(serde_json::json!(40.0)));
+            let second = rt.evaluate_for_cdp(&format!("{name} += 2; {name}"), true, await_promise).await.unwrap();
+            assert!(!second.thrown);
+            assert_eq!(second.value, Some(serde_json::json!(42.0)));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
