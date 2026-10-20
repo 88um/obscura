@@ -24766,9 +24766,7 @@ mod tests {
 
     /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
     /// input event. If the method isn't defined Playwright retries until its
-    /// action timeout fires. Without a layout engine we can't compute it
-    /// properly, so the stub always returns true — still strictly better
-    /// than the undefined path.
+    /// action timeout fires, so it must exist and be true for plain elements.
     #[test]
     fn element_check_visibility_is_callable() {
         let mut rt = setup_runtime(r#"<div id="x">x</div>"#);
@@ -24781,6 +24779,84 @@ mod tests {
             .evaluate("typeof document.getElementById('x').checkVisibility")
             .unwrap();
         assert_eq!(typeof_method, serde_json::json!("function"));
+    }
+
+    /// Issue #1067: checkVisibility() follows the CSSOM View algorithm:
+    /// elements without a box (display:none on self or an ancestor,
+    /// display:contents, disconnected) are hidden, and the opacity /
+    /// visibility options are honored, including their legacy aliases.
+    #[test]
+    fn element_check_visibility_follows_css_boxes_and_options() {
+        let mut rt = setup_runtime(
+            r#"
+            <div style="display:none"><a id="a" href="/x">hidden</a></div>
+            <div style="visibility:hidden"><a id="b" href="/x">invisible</a></div>
+            <div style="opacity:0"><span id="c">transparent</span></div>
+            <span id="e" style="display:contents">contents</span>
+            <span id="f" style="display:none">self none</span>
+            <div style="visibility:hidden"><span id="g" style="visibility:visible">back</span></div>
+            <a id="v" href="/x">visible</a>
+            "#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const $ = id => document.getElementById(id);
+                return [
+                  $('a').checkVisibility(),
+                  $('b').checkVisibility(),
+                  $('b').checkVisibility({visibilityProperty: true}),
+                  $('b').checkVisibility({checkVisibilityCSS: true}),
+                  $('c').checkVisibility(),
+                  $('c').checkVisibility({opacityProperty: true}),
+                  $('c').checkVisibility({checkOpacity: true}),
+                  $('e').checkVisibility(),
+                  $('f').checkVisibility(),
+                  $('g').checkVisibility({visibilityProperty: true}),
+                  $('v').checkVisibility({visibilityProperty: true, opacityProperty: true}),
+                  document.createElement('div').checkVisibility(),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, true, false, false, true, false, false, false, false, true, true, false
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_flat_tree_box_presence() {
+        let mut rt = setup_runtime(r#"<details><summary id="summary">show</summary>
+            <span id="closed">closed</span></details><div id="host"><span id="unslotted">light</span></div>
+            <div id="zero" style="width:0;height:0"></div><span id="empty"></span>
+            <table><tr id="row" style="display:none"><td>hidden</td></tr></table>"#);
+        let result = rt.evaluate(r#"(() => {
+            const root = document.getElementById('host').attachShadow({mode:'open'});
+            root.innerHTML = '<span id="shadow">shadow</span>';
+            return ['summary','closed','unslotted','zero','empty','row'].map(id =>
+                document.getElementById(id).checkVisibility()).concat(root.getElementById('shadow').checkVisibility());
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,false,false,true,true,false,true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_the_owning_frame() {
+        let mut rt = setup_runtime("<div style='display:none'><span>parent hidden</span></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<div id="shown">child</div><div id="hidden" style="display:none">hidden</div>';
+            const shown = d.getElementById('shown'), hidden = d.getElementById('hidden');
+            const parentCheck = Element.prototype.checkVisibility;
+            return [shown.checkVisibility(),hidden.checkVisibility(),
+                parentCheck.call(shown),parentCheck.call(hidden)];
+        })()"#).unwrap(), serde_json::json!([true,false,true,false]));
     }
 
     /// Playwright's `getByRole` / `getByLabel` locators resolve via ARIA
