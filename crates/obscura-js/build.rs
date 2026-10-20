@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(obscura_external_bootstrap)");
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=build.rs");
@@ -158,25 +159,29 @@ fn main() {
 
 /// Generate a snapshot using the host V8 (for native builds or as fallback).
 fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
-    let bootstrap_js = bootstrap_js.to_string();
+    assert!(bootstrap_js.is_ascii(), "bootstrap source must be ASCII; use Unicode escapes in literals");
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
             cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
             startup_snapshot: None,
             skip_op_registration: true,
-            extensions: vec![],
+            // Extension sources are stored once outside V8's heap, not copied into every isolate.
+            extensions: vec![deno_core::Extension {
+                name: "obscura_bootstrap",
+                js_files: vec![deno_core::ExtensionFileSource::new_computed(
+                    "<obscura:bootstrap>", bootstrap_js.into(),
+                )].into(),
+                ..Default::default()
+            }],
             extension_transpiler: None,
-            with_runtime_cb: Some(Box::new(move |runtime| {
-                runtime
-                    .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
-                    .expect("bootstrap.js should not fail during snapshot creation");
-            })),
+            with_runtime_cb: None,
         },
         None,
     )
     .expect("Failed to create V8 snapshot");
 
     std::fs::write(&snapshot_path, &*output.output).expect("Failed to write snapshot");
+    println!("cargo:rustc-cfg=obscura_external_bootstrap");
     println!(
         "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
         snapshot_path.display()

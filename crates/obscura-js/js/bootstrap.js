@@ -1052,7 +1052,7 @@ const _cancelScheduled = (nativeId) => {
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
 // `acw_sc__v2` challenge drives `setTimeout('reload(arg2)', 2)`). A string is
 // compiled and run in global scope, identical to a real browser; otherwise the
-// call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
+// call silently no-ops and JS-triggered navigations (cookie -> reload) never fire.
 const _coerceTimerFn = (fn) => {
   if (typeof fn === "string") {
     // Per HTML, a string handler is compiled and run as a classic script in
@@ -1818,7 +1818,7 @@ class CSSStyleDeclaration {
     this._loaded = true;
   }
   // Serialize `_props` back onto the owner's `style` attribute after a mutation,
-  // so el.style.x = … and cssText reflect into getAttribute('style') and
+  // so el.style.x = ... and cssText reflect into getAttribute('style') and
   // serialization. No-op when owner-less.
   _push() {
     const o = this._owner;
@@ -2936,7 +2936,7 @@ class Node {
     }
     // Clone structurally via real DOM nodes rather than round-tripping through a
     // throwaway <div>.innerHTML: the fragment parser discards elements that are
-    // not valid children of <div> (<tr>, <td>, <option>, …), so the old path
+    // not valid children of <div> (<tr>, <td>, <option>, ...), so the old path
     // returned null for them and lost JS-set inline styles. Building each node
     // directly with createElement(NS) + attribute copy avoids any parsing
     // context, and an explicit stack keeps a deep subtree from overflowing the
@@ -3441,8 +3441,8 @@ function _htmlAttrName(el, n) {
   return n;
 }
 
-// A submit button per the HTML spec: a <button> whose type is submit — the
-// default, including when the type attribute is missing or invalid — or an
+// A submit button per the HTML spec: a <button> whose type is submit (the
+// default, including when the type attribute is missing or invalid), or an
 // <input> of type submit/image. Used to validate requestSubmit's submitter.
 // The HTML "labeled control" of a <label>: the element referenced by its `for`
 // attribute, or the first labelable descendant. Labelable elements per spec are
@@ -4166,7 +4166,7 @@ class Element extends Node {
       // `template_contents` allocates one on demand for created templates.
       const nid = +_dom("template_contents", this._nid);
       if (nid >= 0) {
-        // Cache by node id so `.content` keeps a stable identity across reads —
+        // Cache by node id so `.content` keeps a stable identity across reads;
         // frameworks stash the fragment and compare it later.
         if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
         const content = _cache.get(nid);
@@ -5305,7 +5305,7 @@ class Element extends Node {
     }
   }
   // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
-  // cancelable `submit` event — a page's submit listener cannot veto it. Only
+  // cancelable `submit` event: a page's submit listener cannot veto it. Only
   // requestSubmit() and user-initiated submits fire the cancelable event.
   // Conflating the two broke sites whose submit listener preventDefault()s the
   // native submit and then calls form.submit() from a callback (e.g. an
@@ -6527,7 +6527,7 @@ class Document extends Node {
   // Legacy DOM Level 2 event factory. Spec returns an event of the requested
   // class with an empty type until init*Event() is called. We previously
   // returned a generic Event for every type, which broke libraries that call
-  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  // createEvent('CustomEvent').initCustomEvent(...), see issue #41.
   createEvent(type) {
     const eventType = String(type || '');
     const normalized = eventType.toLowerCase();
@@ -6611,8 +6611,8 @@ class Document extends Node {
         return null;
       },
       // DOM 6.1 "previousNode", implemented as specified (issue #462). The old
-      // version looked at exactly one candidate — the previous sibling's
-      // deepest last child — and returned null the moment it was filtered out,
+      // version looked at exactly one candidate (the previous sibling's
+      // deepest last child) and returned null the moment it was filtered out,
       // so a backward walk died mid-tree the way nextNode used to before #432.
       //
       // Unlike nextNode this stays in JS rather than using a DOM traversal op:
@@ -6627,7 +6627,7 @@ class Document extends Node {
             node = sibling;
             let verdict = this._filter(node);
             // Descend to the deepest last descendant, but never into a rejected
-            // subtree — that is what makes REJECT prune backwards as well.
+            // subtree: that is what makes REJECT prune backwards as well.
             while (verdict !== 2 && node.lastChild) {
               node = node.lastChild;
               verdict = this._filter(node);
@@ -6778,7 +6778,7 @@ class Document extends Node {
     return globalThis.__obscura_focused || this.body;
   }
   // The element that scrolls the viewport, and where the page offset lives
-  // (issue #468). Standards mode, so documentElement — quirks mode would be
+  // (issue #468). Standards mode, so documentElement; quirks mode would be
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
   get implementation() {
@@ -6786,7 +6786,7 @@ class Document extends Node {
     return {
       // Spec: createHTMLDocument returns a NEW detached Document. jQuery
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result — when we returned `globalThis.document`, the real
+      // the result: when we returned `globalThis.document`, the real
       // `<body>` was wiped, taking every page on the open web that ships
       // jQuery 3.x with it. Reuse the DOMParser path to build a detached
       // document, then optionally set the title.
@@ -6866,7 +6866,7 @@ class Document extends Node {
     if (method) return Reflect.apply(method, this, args);
     var html = args.join('');
     if (!html) return;
-    // The host parses into the input stream and returns [[parent, node], …], parents first. The
+    // The host parses into the input stream and returns [[parent, node], ...], parents first. The
     // insertion stays here, because appendChild does more than append: it reports the
     // mutation, registers window named access, and loads a written stylesheet.
     _insertWrittenNodes(this, _domParse("document_write", "", html) || []);
@@ -8557,7 +8557,7 @@ if (typeof Headers === "undefined") {
   };
 }
 
-// XMLHttpRequestEventTarget — spec-required ancestor for XHR EventTarget methods.
+// XMLHttpRequestEventTarget: spec-required ancestor for XHR EventTarget methods.
 // zone.js prefers to walk XMLHttpRequestEventTarget.prototype for addEventListener/
 // removeEventListener/dispatchEvent descriptors before falling back to XHR.prototype.
 class XMLHttpRequestEventTarget {
@@ -8773,7 +8773,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     }
   }
 
-  // Per WHATWG DOM spec — required by zone.js which patches XHR via
+  // Per WHATWG DOM spec, required by zone.js which patches XHR via
   // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
   dispatchEvent(event) {
     if (!event || !event.type) return false;
@@ -9097,7 +9097,7 @@ if (typeof Response === 'undefined') {
 }
 
 if (!Element.prototype.replaceWith) {
-  // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
+  // _convertNodes turns any non-node argument (numbers, booleans, null, ...) into
   // a Text node via String(n), matching the spec and append()/prepend(); the
   // old `typeof n === 'string'` check corrupted insert_before for other types.
   Element.prototype.replaceWith = function(...nodes) {
@@ -9139,7 +9139,7 @@ if (!Element.prototype.after) {
 
 // ChildNode mixin: also mix before/after/replaceWith/remove into
 // CharacterData.prototype (covers Text, Comment, ProcessingInstruction).
-// These are the same implementations as Element.prototype — frameworks
+// These are the same implementations as Element.prototype; frameworks
 // (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
 if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
 // The legacy alias Chromium still ships.
@@ -10311,7 +10311,7 @@ class CSSStyleSheet extends StyleSheet {
   _refreshFromOwner() {
     const state = _cssStyleSheetPrivate.get(this);
     if (!state || !(state.linked ? this._ownerNode : this._sourceNode)) return;
-    // Tracing iterates every rule. Copying the source for each item is O(n²).
+    // Tracing iterates every rule. Copying the source for each item is O(n^2).
     // The host generations include native imports and their origin-clean state.
     const generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
     if (state.generation === generation) return;
@@ -10952,7 +10952,7 @@ const _CE_RESERVED = new Set(['annotation-xml', 'color-profile', 'font-face', 'f
 function _isValidCustomElementName(name) {
   if (typeof name !== 'string' || _CE_RESERVED.has(name)) return false;
   // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
-  return /^[a-z][a-z0-9._·À-￿-]*-[a-z0-9._·À-￿-]*$/.test(name);
+  return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(name);
 }
 class CustomElementRegistry {
   constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
@@ -12246,7 +12246,7 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
 // valid XML is never falsely flagged.
 const _checkXmlWellFormed = (html) => {
   // Strip comments, CDATA sections, processing instructions, and DOCTYPE
-  // declarations — they may contain angle brackets.
+  // declarations: they may contain angle brackets.
   const s = html
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
@@ -12303,8 +12303,8 @@ const _checkXmlWellFormed = (html) => {
 // HTML uses an inert document parse; XML retains the limited HTML-backed shim.
 // Conservative XML well-formedness check. obscura has no XML parser, so this
 // only decides whether to surface a <parsererror> (it does not build an XML
-// tree). It flags clear structural errors — mismatched or unclosed tags,
-// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
+// tree). It flags clear structural errors (mismatched or unclosed tags,
+// multiple/no root elements, unterminated comment/CDATA/PI) and defaults to
 // "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
 // flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
 // skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
@@ -12422,7 +12422,7 @@ globalThis.DOMParser = class DOMParser {
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
         // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper — matches Chrome's behavior.
+        // <html> wrapper, matching Chrome's behavior.
         if (isParserError) return root.firstElementChild;
         return root;
       },
@@ -12467,7 +12467,7 @@ globalThis.DOMParser = class DOMParser {
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
       querySelector(s) {
-        // For XML parsererror docs, check the root element as well —
+        // For XML parsererror docs, check the root element as well;
         // the <parsererror> is the documentElement, not a descendant.
         return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
       },
@@ -13009,7 +13009,7 @@ function _structuredClone(value, seen) {
   }
   // Plain objects clone onto Object.prototype (like Chrome), not the source's
   // prototype. Define each property instead of assigning it: a source with an
-  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":…}')
+  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":...}')
   // yields) would otherwise hit the inherited __proto__ setter and reparent
   // the clone instead of copying the property.
   const out = Array.isArray(value) ? [] : {};
@@ -13177,7 +13177,7 @@ globalThis.atob = globalThis.atob || ((s) => {
 // Internally we keep a tiny in-memory stack of {state, url} entries. push/
 // replace mutate the stack and set globalThis.__virtualUrl so location.href
 // reads the new URL. Real Chrome doesn't fire popstate on push/replace,
-// only on user-driven back/forward — we match that exactly.
+// only on user-driven back/forward; we match that exactly.
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
@@ -13199,7 +13199,7 @@ globalThis.atob = globalThis.atob || ((s) => {
   const historyToken = Symbol("History");
   const resolveHistoryUrl = (url, method) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
-    // current document URL per the HTML spec — capture it so the entry does not
+    // current document URL per the HTML spec; capture it so the entry does not
     // reset location back to the original document URL.
     if (url === null || url === undefined) return __currentUrl();
     const base = __currentUrl();
@@ -15328,8 +15328,8 @@ globalThis.__obscura_frameObjects = Object.create(null);
 // The frames of this realm whose element is still in the document.
 //
 // Liveness is asked of the element, not of a document query: an iframe inside
-// a shadow root is absent from `document.querySelectorAll('iframe')` — the
-// shape a challenge widget uses — while `isConnected` reports it correctly.
+// a shadow root is absent from `document.querySelectorAll('iframe')` (the
+// shape a challenge widget uses), while `isConnected` reports it correctly.
 // Treating it as gone would tear down a frame that is still in the page.
 globalThis.__obscura_liveFrameIds = function () {
   const live = [];
@@ -16568,13 +16568,13 @@ globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
   // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
   // origin) and throws a TypeError on missing/non-Blob input. The old code named
-  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // the engine ("blob:obscura/"), a one-line anti-bot tell, used a base36 token
   // no UUID parser accepts, and handed back a well-formed-looking string for
   // invalid input so the caller only failed later at the fetch (issue #751).
   if (arguments.length === 0) {
     throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
   }
-  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid;
   // Chrome throws for anything else. Duck-typing on `.text()` used to accept
   // Response and other unrelated objects.
   const isBlob = blob != null && typeof blob === 'object' &&
@@ -16589,7 +16589,7 @@ URL.createObjectURL = function(blob) {
     const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
       ? crypto.randomUUID()
       : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          // CSPRNG, not Math.random(): blob IDs must not be predictable.
           const b = new Uint8Array(1);
           crypto.getRandomValues(b);
           const r = b[0] & 0x0f;
@@ -17483,7 +17483,7 @@ if (typeof EventSource === 'undefined') {
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
+      // Validate URL scheme per spec: Chrome throws SyntaxError for non-ws/wss URLs
       if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
         throw new DOMException(
           "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
@@ -18175,7 +18175,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           (!('__obscuraPointerEventsNone' in r) && el.style?.pointerEvents === 'none')) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
         // A descendant's layout rect can extend beyond an overflow clip. It
-        // must not win hit testing where its scrolling ancestor hides it —
+        // must not win hit testing where its scrolling ancestor hides it;
         // otherwise a wheel well outside a small pane scrolls that pane
         // instead of the page behind it.
         var visible = true;
@@ -19032,7 +19032,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // enumerable: false, so every interface written as a `class` here disagrees with
 // the platform on that one descriptor bit.
 //
-// zone.js — which Angular installs on every page — discovers methods by walking
+// zone.js (which Angular installs on every page) discovers methods by walking
 // `for (prop in instance)` in patchClass(), applied to MutationObserver,
 // WebKitMutationObserver, IntersectionObserver and FileReader. With
 // enumerable: false it finds no methods at all and builds its proxy prototype

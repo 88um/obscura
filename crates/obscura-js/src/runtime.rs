@@ -642,7 +642,14 @@ impl ObscuraJsRuntime {
             deno_core::v8::icu::set_default_locale("en-US");
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: vec![build_extension()],
+                extensions: if cfg!(obscura_external_bootstrap) {
+                    vec![deno_core::Extension {
+                        name: "obscura_bootstrap",
+                        ..Default::default()
+                    }, build_extension()]
+                } else {
+                    vec![build_extension()]
+                },
                 module_loader: Some(module_loader),
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
@@ -4650,6 +4657,27 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_source_uses_ascii_snapshot_storage() {
+        let source = include_str!("../js/bootstrap.js")
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+        assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
+        if cfg!(obscura_external_bootstrap) {
+            assert_eq!(super::SNAPSHOT.windows(source.len())
+                .filter(|window| *window == source.as_bytes()).count(), 1,
+                "native snapshots must retain one shared source backing");
+        }
+    }
+
+    #[test]
+    fn custom_element_names_keep_unicode_characters() {
+        let mut rt = setup_runtime("<main></main>");
+        assert_eq!(rt.evaluate(r#"['widget-\u00e9','widget-\u00b7','widget-\u0100'].every(name => {
+            customElements.define(name, class extends HTMLElement {});
+            return typeof customElements.get(name) === 'function';
+        })"#).unwrap(), serde_json::json!(true));
+    }
+
     #[test]
     fn classic_code_cache_reuses_compilation_not_page_state() {
         use std::sync::atomic::Ordering;
