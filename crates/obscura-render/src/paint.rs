@@ -2389,6 +2389,13 @@ fn computed_display(style: &crate::LayoutStyle) -> &'static str {
         "contents"
     } else if style.display == crate::Display::None {
         "none"
+    } else if let Some(display) = style.table_row_display {
+        match display {
+            crate::TableRowDisplay::Row => "table-row",
+            crate::TableRowDisplay::Group => "table-row-group",
+            crate::TableRowDisplay::Header => "table-header-group",
+            crate::TableRowDisplay::Footer => "table-footer-group",
+        }
     } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
         "flow-root"
     } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
