@@ -130,6 +130,13 @@ rendering, only inline styles are checked. CSS `content-visibility: hidden` and
 Listbox option/optgroup boxes are also not rendered, so their visibility queries
 currently return `false` even when Chromium returns `true`.
 
+Native table rows and sections can be revealed with explicit `display: table-row`,
+`table-row-group`, `table-header-group`, and `table-footer-group` declarations.
+CSS-created tables with explicit rows/groups share column tracks and expose row
+and group geometry. Full anonymous-table fixup for mixed content is not implemented;
+unsupported CSS table structures retain ordinary box layout rather than dropping
+their non-table children.
+
 ## Current limits
 
 - Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.

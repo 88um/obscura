@@ -408,6 +408,11 @@
   "reduced-motion-emulation": [
     {"name": "normal motion keeps the default width", "color": "#22aa66", "width": 100, "height": 30}
   ],
+  "table-display-keywords": [
+    {"name": "explicit row and group display override display none", "color": "#1971c2", "x": 20, "y": 20, "width": 40, "height": 20},
+    {"name": "CSS rows share their first column", "color": "#087f5b", "x": 150, "y": 20, "width": 30, "height": 40},
+    {"name": "CSS rows share their second column", "color": "#7048e8", "x": 180, "y": 20, "width": 40, "height": 40}
+  ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
