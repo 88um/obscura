@@ -18768,6 +18768,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_details_toggle_tracks_open_attribute_changes() {
+        let mut rt = setup_runtime(r#"<details id="panel"><summary>More</summary></details>"#);
+        let protected = rt
+            .evaluate(
+                r#"
+            const helper = globalThis.__obscura_activateSummary;
+            globalThis.toggleStates = [];
+            document.getElementById('panel').addEventListener('toggle', event => {
+                toggleStates.push([event.oldState, event.newState]);
+            });
+            return [!Reflect.set(globalThis, '__obscura_activateSummary', () => false),
+             !Reflect.deleteProperty(globalThis, '__obscura_activateSummary'),
+             globalThis.__obscura_activateSummary === helper];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(protected, serde_json::json!([true, true, true]));
+
+        rt.evaluate("document.getElementById('panel').open = true")
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("toggleStates").unwrap(),
+            serde_json::json!([["closed", "open"]])
+        );
+
+        rt.evaluate("document.getElementById('panel').setAttribute('open', '')")
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("toggleStates").unwrap(),
+            serde_json::json!([["closed", "open"]])
+        );
+
+        rt.evaluate("document.getElementById('panel').toggleAttribute('open')")
+            .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("toggleStates").unwrap(),
+            serde_json::json!([["closed", "open"], ["open", "closed"]])
+        );
+
+        rt.evaluate(
+            "const panel = document.getElementById('panel'); panel.setAttributeNS(null, 'open', ''); panel.removeAttributeNS(null, 'open')",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("toggleStates").unwrap(),
+            serde_json::json!([
+                ["closed", "open"],
+                ["open", "closed"],
+                ["closed", "closed"]
+            ])
+        );
+    }
+
     #[test]
     fn test_label_click_activates_its_labeled_control() {
         let mut rt = setup_runtime(

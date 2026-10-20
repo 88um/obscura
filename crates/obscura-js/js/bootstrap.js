@@ -3489,18 +3489,12 @@ const _forwardingLabels = new WeakSet();
 const _TRUSTED_ACTIVATION = Symbol('obscura.trustedActivation');
 
 const _pendingDetailsToggles = new WeakMap();
-globalThis.__obscura_activateSummary = function(target) {
-  const summary = target.tagName === 'SUMMARY' ? target : target.closest?.('summary');
-  if (!summary || summary.parentElement?.tagName !== 'DETAILS') return false;
-  const interactive = target.closest?.(_INTERACTIVE);
-  if (interactive && summary.contains(interactive)) return false;
-  const details = summary.parentElement;
-  let firstSummary = details.firstElementChild;
-  while (firstSummary && firstSummary.tagName !== 'SUMMARY') firstSummary = firstSummary.nextElementSibling;
-  if (firstSummary !== summary) return false;
-  const oldState = details.open ? 'open' : 'closed';
-  const newState = details.open ? 'closed' : 'open';
-  details.open = !details.open;
+function _queueDetailsToggle(details, oldOpen) {
+  if (details.localName !== 'details') return;
+  const newOpen = details.hasAttribute('open');
+  if (oldOpen === newOpen) return;
+  const oldState = oldOpen ? 'open' : 'closed';
+  const newState = newOpen ? 'open' : 'closed';
   const pending = _pendingDetailsToggles.get(details);
   if (pending) {
     pending.newState = newState;
@@ -3512,6 +3506,18 @@ globalThis.__obscura_activateSummary = function(target) {
       details.dispatchEvent(new ToggleEvent('toggle', states));
     }, 0);
   }
+}
+
+globalThis.__obscura_activateSummary = function(target) {
+  const summary = target.tagName === 'SUMMARY' ? target : target.closest?.('summary');
+  if (!summary || summary.parentElement?.tagName !== 'DETAILS') return false;
+  const interactive = target.closest?.(_INTERACTIVE);
+  if (interactive && summary.contains(interactive)) return false;
+  const details = summary.parentElement;
+  let firstSummary = details.firstElementChild;
+  while (firstSummary && firstSummary.tagName !== 'SUMMARY') firstSummary = firstSummary.nextElementSibling;
+  if (firstSummary !== summary) return false;
+  details.open = !details.open;
   return true;
 };
 
@@ -3567,7 +3573,7 @@ globalThis.__obscura_interactiveHost = function(el) {
 };
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
-for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
+for (const _name of ['__obscura_activateLabel', '__obscura_activateSummary', '__obscura_isDisabled',
                      '__obscura_labeledControl', '__obscura_interactiveHost',
                      '__obscura_inputChecked', '__obscura_setInputChecked',
                      '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate']) {
@@ -4276,6 +4282,9 @@ class Element extends Node {
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
+    const detailsWasOpen = this.localName === 'details' && n === 'open'
+      ? this.hasAttribute('open')
+      : null;
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
@@ -4283,6 +4292,7 @@ class Element extends Node {
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (n === "src" && this.localName === "iframe" && !this.hasAttribute('srcdoc')) {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
@@ -4324,8 +4334,12 @@ class Element extends Node {
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
     const localName = n.includes(":") ? n.slice(n.indexOf(":") + 1) : n;
+    const detailsWasOpen = this.localName === 'details' && ns === '' && localName === 'open'
+      ? this.hasAttribute('open')
+      : null;
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
@@ -4337,12 +4351,16 @@ class Element extends Node {
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
     if (n === 'srcdoc' && this.localName === 'iframe' && !this.hasAttribute(n)) return;
+    const detailsWasOpen = this.localName === 'details' && n === 'open'
+      ? this.hasAttribute('open')
+      : null;
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     _dom("remove_attribute", this._nid, n);
+    if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
@@ -4373,9 +4391,13 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    const detailsWasOpen = this.localName === 'details' && ns === '' && n === 'open'
+      ? this.hasAttribute('open')
+      : null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');

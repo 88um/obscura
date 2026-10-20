@@ -15,7 +15,7 @@ async fn serve_fixture() -> String {
         let _ = socket.read(&mut buf).await.unwrap();
         // The labels carry their own boxes so a coordinate click has a target
         // regardless of inline-wrapper geometry.
-        let body = r#"<!doctype html><html><head><style>
+        let body = r##"<!doctype html><html><head><style>
             html, body { margin: 0; font: 16px monospace }
             label, summary { display: block; width: 200px; height: 40px }
         </style></head><body>
@@ -25,6 +25,8 @@ async fn serve_fixture() -> String {
           <input id="boxc" type="checkbox">
           <label id="off" for="boxd">d</label><input id="boxd" type="checkbox" disabled>
           <details id="panel"><summary id="summary">More</summary><p>Content</p></details>
+          <details id="link-panel"><summary><a id="summary-link" href="#target">Link</a></summary></details>
+          <div id="target">Target</div>
           <script>
             window.events = [];
             for (const id of ['boxa','boxb','boxc','boxd']) {
@@ -34,7 +36,7 @@ async fn serve_fixture() -> String {
               }
             }
           </script>
-        </body></html>"#;
+        </body></html>"##;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -149,6 +151,16 @@ async fn mouse_click_on_summary_toggles_details() {
     click_element(&mut ctx, 60, &sid, "#summary").await;
     let closed = evaluate(&mut ctx, 70, "document.getElementById('panel').open", &sid).await;
     assert_eq!(closed["result"]["value"], false);
+
+    click_element(&mut ctx, 80, &sid, "#summary-link").await;
+    let link_state = evaluate(
+        &mut ctx,
+        90,
+        "[document.getElementById('link-panel').open, location.hash]",
+        &sid,
+    )
+    .await;
+    assert_eq!(link_state["result"]["value"], json!([false, "#target"]));
 }
 
 #[tokio::test(flavor = "current_thread")]
