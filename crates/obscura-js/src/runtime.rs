@@ -4584,6 +4584,38 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(obscura_external_bootstrap)]
+    #[test]
+    fn snapshot_core_methods_have_bytecode_before_first_use() {
+        crate::v8_flags::set_v8_flags("--allow-natives-syntax");
+        let mut rt = super::ObscuraJsRuntime::new();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const methods = [Node, Element, Document, Response, Headers,
+                Node.prototype.appendChild, Document.prototype.createElement,
+                Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get,
+                Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').set];
+            // V8's kInterpreted bit identifies shared bytecode, including
+            // restored closures whose entry point is still CompileLazy.
+            return methods.filter(fn => !(%GetOptimizationStatus(fn) & (1 << 6)))
+                .map(fn => fn.name);
+        })()"#).unwrap(), serde_json::json!([]),
+            "common browser operations must not recompile in each fresh document");
+    }
+
+    #[test]
+    fn snapshot_compiler_is_not_available_in_page_or_frame_realms() {
+        let mut rt = setup_runtime("<html><body><iframe id='frame'></iframe></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const check = `(function() {
+                let denied = false;
+                try { Function('return %GetOptimizationStatus(function() {});')(); }
+                catch (error) { denied = error instanceof SyntaxError; }
+                return denied && !('__obscura_snapshot_compile' in globalThis);
+            })()`;
+            return [eval(check), document.getElementById('frame').contentWindow.eval(check)];
+        })()"#).unwrap(), serde_json::json!([true, true]));
+    }
+
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
         let source = include_str!("../js/bootstrap.js")
