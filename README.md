@@ -97,6 +97,7 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
       No KYC required<br>
+      Check Nodemaven's new GitHub for more web scraping and automation solutions - https://github.com/nodemaven<br>
       Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br><br>
       🎁 <b>Special codes for Obscura users:</b><br>
       <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
