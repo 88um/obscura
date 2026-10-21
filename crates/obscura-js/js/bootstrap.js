@@ -50,7 +50,7 @@ const __obscuraCore = globalThis.Deno.core;
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
-    '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
+    '_urlResolveOp', '_decodeBodyWithCharset',
     '_selectionFor', '_isConstructorCE', '_isValidCustomElementName', '_shadowRootForHost',
     '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
@@ -202,28 +202,33 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+const _nativeFns = new WeakSet();
+const _nativeFnHas = _nativeFns.has.bind(_nativeFns);
+const _nativeFnAdd = _nativeFns.add.bind(_nativeFns);
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
+const _nativeStrHas = _nativeStr.has.bind(_nativeStr);
+const _nativeStrGet = _nativeStr.get.bind(_nativeStr);
+const _nativeStrSet = _nativeStr.set.bind(_nativeStr);
 const _origToString = Function.prototype.toString;
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
+    if (_nativeStrHas(this)) { return _nativeStrGet(this); }
+    if (_nativeFnHas(this)) {
       return `function ${this.name || ''}() { [native code] }`;
     }
     return _origToString.call(this);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
-function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+function _markNative(fn) { if (typeof fn === 'function') _nativeFnAdd(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
-function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
-_nativeFns.add(_functionToString);
+function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStrSet(fn, str); return fn; }
+_nativeFnAdd(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
@@ -713,7 +718,8 @@ function _fpNoise(x, y, channel) {
 }
 
 var _fpCache = null;
-function _getFp() {
+// Parenthesized helpers retain compiled bytecode in the startup snapshot.
+const _getFp = (function _getFp() {
   if (_fpCache) return _fpCache;
   const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
   const isMac = _uaPlat === 'macOS';
@@ -781,7 +787,7 @@ function _getFp() {
     canvasFingerprint: cfp,
   };
   return _fpCache;
-}
+});
 function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
@@ -1791,19 +1797,22 @@ function _serializeCss(props) {
   return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
 }
 
+const _styleDefineProperty = Object.defineProperty;
+const _styleProxyConstructor = Proxy;
+const _styleReflectApply = Reflect.apply;
 class CSSStyleDeclaration {
   constructor(owner, onChange) {
     // Non-enumerable so they never leak through the proxy's own-key traps.
-    Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
     // The owner Element, if any. A live declaration reflects that element's
     // `style` content attribute in both directions; an owner-less declaration
     // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
-    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
-    Object.defineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
     // Load the content attribute only when style is first observed. Keeping
     // this as a primitive avoids allocating a separate sync object for every
     // wrapped element.
-    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
   }
   // Pull the initial `style` attribute once. Later attribute mutations update
   // the declaration directly from Element.setAttribute/removeAttribute, so
@@ -1871,7 +1880,7 @@ class CSSStyleDeclaration {
   item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
-const _styleProxy = (decl) => new Proxy(decl, {
+const _styleProxyHandler = {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
     if (/^\d+$/.test(p)) return t.item(+p);
@@ -1913,7 +1922,8 @@ const _styleProxy = (decl) => new Proxy(decl, {
     }
     return undefined;
   },
-});
+};
+const _styleProxy = (decl) => new _styleProxyConstructor(decl, _styleProxyHandler);
 
 // Clone a single node (no children), used by Node.cloneNode. Elements are built
 // with createElement/createElementNS and their content attributes copied, so no
@@ -4025,6 +4035,21 @@ function _renderedInnerText(element) {
     .replace(/^[ \n\t]+|[ \n\t]+$/g, '');
 }
 
+const _elementStyles = new WeakMap();
+const _elementStyleGet = _elementStyles.get.bind(_elementStyles);
+const _elementStyleSet = _elementStyles.set.bind(_elementStyles);
+function _elementStyle(element) {
+  let style = _elementStyleGet(element);
+  if (!style) {
+    // A borrowed getter must return the owning realm's same declaration.
+    const member = _documentRealmMember(element, 'elementStyle');
+    style = member ? _styleReflectApply(member, element, [])
+      : _styleProxy(new CSSStyleDeclaration(element));
+    _elementStyleSet(element, style);
+  }
+  return style;
+}
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -4042,7 +4067,6 @@ class Element extends Node {
       Object.setPrototypeOf(upgrading, new.target.prototype);
       return upgrading;
     }
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -4233,8 +4257,8 @@ class Element extends Node {
       this.setAttribute("for", String(v));
     }
   }
-  get style() { return this._style; }
-  set style(v) { if (typeof v === "string") this._style.cssText = v; }
+  get style() { return _elementStyle(this); }
+  set style(v) { if (typeof v === "string") _elementStyle(this).cssText = v; }
   getAttribute(n) {
     n = _htmlAttrName(this, n);
     // Script-created elements start with a provably empty attribute set. Keep
@@ -4272,7 +4296,7 @@ class Element extends Node {
         _reconcileWindowNamedProperty(previousWindowName);
       }
     }
-    if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -4305,7 +4329,7 @@ class Element extends Node {
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
-    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -4325,7 +4349,7 @@ class Element extends Node {
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
     }
-    if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -4352,7 +4376,7 @@ class Element extends Node {
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
-    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -7596,7 +7620,7 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
-function _elementClassFor(nid) {
+const _elementClassFor = (function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
@@ -7637,8 +7661,8 @@ function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   return Element;
-}
-function _elementClassForKnownName(namespace, qualifiedName) {
+});
+const _elementClassForKnownName = (function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
@@ -7664,8 +7688,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
-}
-function _wrap(nid) {
+});
+const _wrap = (function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
@@ -7680,15 +7704,15 @@ function _wrap(nid) {
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
-}
-function _wrapEl(nid) {
+});
+const _wrapEl = (function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
   return n;
-}
+});
 
 globalThis._wrap = _wrap;
 globalThis.self = globalThis;
@@ -8438,7 +8462,7 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-async function _fetch(input, init = {}, resourceType = "Fetch") {
+const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -8540,7 +8564,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     });
   }
   return response;
-}
+});
 globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
@@ -9513,20 +9537,6 @@ if (typeof TextEncoder === 'undefined') {
     encodeInto(str, dest) { const enc = this.encode(str); dest.set(enc.slice(0, dest.length)); return { read: str.length, written: Math.min(enc.length, dest.length) }; }
   };
 }
-// Fast pure-JS UTF-8 decode (the common case: Response/Blob .text(), most
-// pages). Avoids the op + JSON round trip for plain UTF-8.
-function _utf8DecodeBytes(bytes, start) {
-  let str = '', i = start | 0;
-  const n = bytes.length;
-  while (i < n) {
-    let c = bytes[i++];
-    if (c < 0x80) str += String.fromCharCode(c);
-    else if (c < 0xE0) str += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
-    else if (c < 0xF0) { const b1 = bytes[i++], b2 = bytes[i++]; str += String.fromCharCode(((c & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)); }
-    else { const b1 = bytes[i++], b2 = bytes[i++], b3 = bytes[i++]; const cp = ((c & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); if (cp > 0xFFFF) { const s = cp - 0x10000; str += String.fromCharCode(0xD800 + (s >> 10), 0xDC00 + (s & 0x3FF)); } else str += String.fromCharCode(cp); }
-  }
-  return str;
-}
 if (typeof TextDecoder === 'undefined') {
   globalThis.TextDecoder = class TextDecoder {
     constructor(label, options) {
@@ -9549,11 +9559,9 @@ if (typeof TextDecoder === 'undefined') {
       const bytes = ArrayBuffer.isView(input)
         ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
         : new Uint8Array(input);
-      // Fast path: plain UTF-8, non-fatal (Response/Blob text, most pages).
-      if (this.encoding === 'utf-8' && !this.fatal) {
-        let off = 0;
-        if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) off = 3;
-        return _utf8DecodeBytes(bytes, off);
+      // The native UTF-8 decoder also replaces malformed sequences, without JSON or per-byte JS work.
+      if (this.encoding === 'utf-8' && !this.fatal && !this.ignoreBOM) {
+        return __obscuraCore.ops.op_decode(bytes);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
       const r = JSON.parse(__obscuraCore.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
@@ -14501,48 +14509,23 @@ function _windowNameEligibleElement(element) {
     && _windowNamedNameTags.has(element.localName);
 }
 
-function _windowNamedSupportedNames(element) {
-  const names = [];
-  if (!element || element.nodeType !== 1) return names;
-  const id = element.getAttribute("id");
-  if (id) names.push(id);
-  if (_windowNameEligibleElement(element)) {
-    const name = element.getAttribute("name");
-    if (name && name !== id) names.push(name);
-  }
-  return names;
-}
-
 function _windowNamedCandidates(name) {
   const doc = globalThis.document;
   if (!doc || !name) return [];
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  const matches = [];
-  for (let i = 0; i < elements.length; i++) {
-    const element = elements[i];
-    if (element.getAttribute("id") === name
-        || (_windowNameEligibleElement(element)
-          && element.getAttribute("name") === name)) {
-      matches.push(element);
-    }
-  }
-  return matches;
+  return _domParse("window_named_candidates", name) || [];
 }
 
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
-  for (const element of matches) {
-    if (element.localName === "iframe" && _windowNameEligibleElement(element)
-        && element.getAttribute("name") === name) {
-      const window = element.contentWindow;
+  for (const [nid, namedFrame] of matches) {
+    if (namedFrame) {
+      const window = _wrapEl(nid).contentWindow;
       if (window) return window;
     }
   }
-  if (matches.length > 1) return HTMLCollection._from(matches);
-  return matches[0];
+  if (matches.length > 1) return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
+  return _wrapEl(matches[0][0]);
 }
 
 function _ensureWindowNamedProperty(name) {
@@ -14580,20 +14563,7 @@ function _reconcileWindowNamedProperty(name) {
 }
 
 function _windowNamedNamesInTree(root) {
-  const names = new Set();
-  if (!root) return names;
-  if (root.nodeType === 1) {
-    for (const name of _windowNamedSupportedNames(root)) names.add(name);
-  }
-  if (typeof root.querySelectorAll === "function") {
-    const elements = root.querySelectorAll(
-      "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-    );
-    for (let i = 0; i < elements.length; i++) {
-      for (const name of _windowNamedSupportedNames(elements[i])) names.add(name);
-    }
-  }
-  return names;
+  return new Set(root ? _domParse("window_named_names", root._nid) || [] : []);
 }
 
 function _registerWindowNamedTree(root) {
@@ -14610,15 +14580,7 @@ function _reconcileWindowNamedProperties(names) {
   if (!names || names.size === 0) return;
   const doc = globalThis.document;
   if (!doc) return;
-  const present = new Set();
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  for (let i = 0; i < elements.length; i++) {
-    for (const name of _windowNamedSupportedNames(elements[i])) {
-      if (names.has(name)) present.add(name);
-    }
-  }
+  const present = _windowNamedNamesInTree(doc);
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
       try { delete globalThis[name]; } catch (_error) {}
@@ -18237,7 +18199,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
 // Ops are bound after snapshot restoration, so probe the renderer at realm
 // initialization, not while building the snapshot with an empty op table.
-function _installCaretGeometry() {
+const _installCaretGeometry = (function _installCaretGeometry() {
   if (typeof __obscuraCore.ops.op_layout_caret !== 'function') return {};
   const positions = new WeakMap();
   function positionState(receiver) {
@@ -18338,7 +18300,7 @@ function _installCaretGeometry() {
     caretRangeFromPoint: Document.prototype.caretRangeFromPoint,
     caretPositionFromPoint: Document.prototype.caretPositionFromPoint,
   };
-}
+});
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
@@ -18351,9 +18313,10 @@ const _documentMembers = Object.freeze(Object.fromEntries([
     return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
+  ['elementStyle', function() { return _elementStyle(this); }],
 ]));
 
-globalThis.__obscura_init = function() {
+globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
@@ -18460,7 +18423,7 @@ globalThis.__obscura_init = function() {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
   delete globalThis.__obscura_init;
-};
+});
 
 // Snapshot-time pre-computation of the hide list. Bootstrap.js runs once
 // during the V8 snapshot build (build.rs); this line captures the set of
