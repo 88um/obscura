@@ -202,28 +202,33 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+const _nativeFns = new WeakSet();
+const _nativeFnHas = _nativeFns.has.bind(_nativeFns);
+const _nativeFnAdd = _nativeFns.add.bind(_nativeFns);
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
+const _nativeStrHas = _nativeStr.has.bind(_nativeStr);
+const _nativeStrGet = _nativeStr.get.bind(_nativeStr);
+const _nativeStrSet = _nativeStr.set.bind(_nativeStr);
 const _origToString = Function.prototype.toString;
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
+    if (_nativeStrHas(this)) { return _nativeStrGet(this); }
+    if (_nativeFnHas(this)) {
       return `function ${this.name || ''}() { [native code] }`;
     }
     return _origToString.call(this);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
-function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+function _markNative(fn) { if (typeof fn === 'function') _nativeFnAdd(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
-function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
-_nativeFns.add(_functionToString);
+function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStrSet(fn, str); return fn; }
+_nativeFnAdd(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from

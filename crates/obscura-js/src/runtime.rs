@@ -4803,6 +4803,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_metadata_does_not_retain_removed_methods() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.execute_runtime_script("<removed-native-method>", r#"(() => {
+            const fn = AudioBuffer.prototype.copyToChannel;
+            if (Function.prototype.toString.call(fn) !== 'function copyToChannel() { [native code] }') {
+                throw new Error('Live method lost its native source');
+            }
+            delete AudioBuffer.prototype.copyToChannel;
+            return fn;
+        })()"#.into()).unwrap();
+        let weak = deno_core::v8::Weak::new(rt.runtime().v8_isolate(), &value);
+        rt.collect_garbage();
+        assert!(!weak.is_empty(), "a caller-held method must remain live");
+        drop(value);
+        rt.collect_garbage();
+        assert!(weak.is_empty(), "native-source metadata must not own a removed method");
+    }
+
+    #[test]
+    fn native_metadata_does_not_retain_removed_accessors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.execute_runtime_script("<removed-native-accessor>", r#"(() => {
+            const fn = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'x').get;
+            if (Function.prototype.toString.call(fn) !== 'function get x() { [native code] }') {
+                throw new Error('Live accessor lost its native source');
+            }
+            delete MouseEvent.prototype.x;
+            return fn;
+        })()"#.into()).unwrap();
+        let weak = deno_core::v8::Weak::new(rt.runtime().v8_isolate(), &value);
+        rt.collect_garbage();
+        assert!(!weak.is_empty(), "a caller-held accessor must remain live");
+        drop(value);
+        rt.collect_garbage();
+        assert!(weak.is_empty(), "native-source metadata must not own a removed accessor");
+    }
+
+    #[test]
+    fn native_source_survives_page_replacement_of_weak_collection_methods() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate_script(r#"(() => {
+            const method = AudioBuffer.prototype.copyToChannel;
+            const getter = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'x').get;
+            const fail = () => { throw new Error('Page collection method called'); };
+            WeakSet.prototype.has = WeakSet.prototype.add = fail;
+            WeakMap.prototype.has = WeakMap.prototype.get = WeakMap.prototype.set = fail;
+            return [method.toString(), getter.toString()];
+        })()"#).unwrap(), serde_json::json!([
+            "function copyToChannel() { [native code] }",
+            "function get x() { [native code] }",
+        ]));
+    }
+
     // #1013: removeAttribute('id') must update the id_index so getElementById no
     // longer returns the (still-attached) element.
     #[test]
