@@ -18435,7 +18435,8 @@ globalThis.__obscura_init = (function() {
 // and leave them out of the hide list (and thus visible to the reflection-API
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
-  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  k !== '__obscura_snapshot_compile' &&
+  (k.startsWith('_') || k.includes('obscura') || k.includes('Obscura'))
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
@@ -19068,5 +19069,21 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (typeof val === 'function') { walk(val); }
   }
 })();
+
+// Compile common bodies at snapshot build time without invoking them.
+if (typeof globalThis.__obscura_snapshot_compile === 'function') {
+  const compile = globalThis.__obscura_snapshot_compile;
+  delete globalThis.__obscura_snapshot_compile;
+  compile([
+    _fpRand, _browserPostedTaskDiscardQueue, _eventTargetDispatch, _domEventDispatch,
+    _runPostConnectionSteps, __prepareInsertedSubtree, _relevantNodeList,
+    _ensureInsertionValidity, _preInsertConverted, _attributeOldValuesWanted,
+    _insertOneNode, _resolveUrl, _applyScreenSize, _bodyToUint8Array, _serializeBody,
+    _releaseLinkedStylesheetsIn, _detachStyleSheetsInSubtree,
+    _scheduleIntersectionRenderCheckpoint, _attachResponseAbort, _nodeList,
+    _ensureWindowNamedProperty, _windowNamedNamesInTree, _registerWindowNamedTree,
+    _reconcileWindowNamedProperties, _installFramingRelationships,
+  ]);
+}
 
 })();

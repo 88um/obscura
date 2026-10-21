@@ -160,6 +160,37 @@ fn main() {
 /// Generate a snapshot using the host V8 (for native builds or as fallback).
 fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
     assert!(bootstrap_js.is_ascii(), "bootstrap source must be ASCII; use Unicode escapes in literals");
+    // Compiler intrinsics are confined to this build process and an unretained hook.
+    deno_core::v8::V8::set_flags_from_string("--allow-natives-syntax");
+    let compiler = r#""use strict";
+Object.defineProperty(globalThis, '__obscura_snapshot_compile', {
+  configurable: true,
+  value(helpers) {
+    const functions = new Set(helpers);
+    const targets = [
+      [Node, ['nodeType', 'textContent', 'parentNode', 'isConnected', 'getRootNode', 'appendChild', 'insertBefore']],
+      [Element, ['tagName', 'innerHTML', 'getAttribute', 'setAttribute', 'querySelector', 'querySelectorAll', 'id']],
+      [Document, ['documentElement', 'getElementById', 'querySelector', 'querySelectorAll', 'createElement', 'createTextNode']],
+      [HTMLImageElement, ['src']],
+      [Response, ['text', 'json']],
+      [Headers, ['get', 'set']],
+      [URL, ['href', 'toString']],
+    ];
+    for (const [constructor, names] of targets) {
+      functions.add(constructor);
+      for (const name of names) {
+        const descriptor = Object.getOwnPropertyDescriptor(constructor.prototype, name);
+        if (!descriptor) throw Error('Missing snapshot member: ' + constructor.name + '.' + name);
+        for (const fn of [descriptor.value, descriptor.get, descriptor.set]) {
+          if (typeof fn === 'function') functions.add(fn);
+        }
+      }
+    }
+    for (const fn of functions) %EnsureFeedbackVectorForFunction(fn);
+  },
+});
+"#;
+    let bootstrap_js = format!("{compiler}{bootstrap_js}");
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
             cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
@@ -174,7 +205,11 @@ fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
                 ..Default::default()
             }],
             extension_transpiler: None,
-            with_runtime_cb: None,
+            with_runtime_cb: Some(Box::new(|runtime| {
+                runtime.execute_script("<obscura:snapshot-check>",
+                    "if ('__obscura_snapshot_compile' in globalThis) throw Error('Snapshot compiler hook was retained');")
+                    .expect("snapshot compiler hook must not reach page realms");
+            })),
         },
         None,
     )
