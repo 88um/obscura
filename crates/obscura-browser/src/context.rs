@@ -295,6 +295,7 @@ impl BrowserContext {
         if context.stealth {
             client.block_trackers = true;
         }
+        client.set_allow_file_access(context.allow_file_access);
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = profile.user_agent.to_string();
         }
@@ -743,11 +744,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn identity_is_cloned_with_proxy_and_context_scoped_values() {
-        let template = BrowserContext::with_options(
+        let mut template = BrowserContext::with_options(
             "template".to_string(),
             Some("http://template.example:8080".to_string()),
             false,
         );
+        template.set_allow_file_access(true);
         let identity = BrowserIdentity {
             fingerprint_seed: "stable-seed".to_string(),
             browser_profile: "chrome_145".to_string(),
@@ -762,6 +764,8 @@ mod tests {
         assert_eq!(context.fingerprint_seed.as_deref(), Some("stable-seed"));
         assert_eq!(context.browser_profile.as_deref(), Some("chrome_145"));
         assert_eq!(context.geolocation, Some((41.0, -87.0)));
+        assert!(context.http_client.allow_file_access(),
+            "--allow-file-access must survive the identity's replacement client");
         assert_eq!(
             context.http_client.proxy_url(),
             identity.proxy_url.as_deref()

@@ -1510,20 +1510,27 @@ async fn cdp_processor(
     let _ = &ctx;
 }
 
+/// Who receives a paused request when a session enabled Fetch on its page.
+#[derive(Debug, PartialEq)]
+enum InterceptionOwner {
+    /// No session recorded Fetch.enable for the page.
+    Unowned,
+    /// The enabling session (None for a browser-level enable).
+    Session(Option<String>),
+    /// The enabling session detached without Fetch.disable.
+    Detached,
+}
+
 /// The session that enabled Fetch on the owning page receives its paused
 /// requests, so a raw CDP client attached beside Playwright keeps them.
-fn interception_route<'a>(
-    ctx: &'a CdpContext,
-    page_id: &str,
-) -> Option<(&'a str, Option<String>)> {
-    let session_id = ctx.fetch_intercept.sessions_by_page.get(page_id)?.clone();
-    if let Some(session) = session_id.as_ref() {
-        if ctx.sessions.get(session).map(String::as_str) != Some(page_id) {
-            return None;
+fn interception_owner(ctx: &CdpContext, page_id: &str) -> InterceptionOwner {
+    match ctx.fetch_intercept.sessions_by_page.get(page_id) {
+        None => InterceptionOwner::Unowned,
+        Some(Some(session)) if ctx.sessions.get(session).map(String::as_str) != Some(page_id) => {
+            InterceptionOwner::Detached
         }
+        Some(session) => InterceptionOwner::Session(session.clone()),
     }
-    let page = ctx.pages.iter().find(|page| page.id == page_id)?;
-    Some((page.frame_id.as_str(), session_id))
 }
 
 fn emit_intercepted_request(
@@ -1538,15 +1545,23 @@ fn emit_intercepted_request(
 ) {
     // Navigation temporarily removes its Page from ctx. Other pages can still
     // have requests queued on the same channel, so never infer their owner.
-    let route = interception_route(ctx, &intercepted.page_id)
-        .or_else(|| navigating_page
-            .filter(|(page_id, _, _)| *page_id == intercepted.page_id)
-            .map(|(_, frame_id, session_id)| (frame_id, session_id)))
-        .or_else(|| {
-            let page = ctx.pages.iter().find(|page| page.id == intercepted.page_id)?;
-            let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
-            Some((page.frame_id.as_str(), Some(session_id.clone())))
-        });
+    let navigating = navigating_page.filter(|(page_id, _, _)| *page_id == intercepted.page_id);
+    let frame_id = navigating.as_ref().map(|(_, frame_id, _)| *frame_id).or_else(|| {
+        ctx.pages.iter().find(|page| page.id == intercepted.page_id).map(|page| page.frame_id.as_str())
+    });
+    let route = match interception_owner(ctx, &intercepted.page_id) {
+        // A detached owner's requests fail rather than surprise another
+        // attachment that never asked to intercept them.
+        InterceptionOwner::Detached => None,
+        InterceptionOwner::Session(session_id) => frame_id.map(|frame_id| (frame_id, session_id)),
+        InterceptionOwner::Unowned => navigating
+            .map(|(_, frame_id, session_id)| (frame_id, session_id))
+            .or_else(|| {
+                let (session_id, _) = ctx.sessions.iter()
+                    .find(|(_, page_id)| **page_id == intercepted.page_id)?;
+                Some((frame_id?, Some(session_id.clone())))
+            }),
+    };
     let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
         crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
     });
@@ -2841,23 +2856,44 @@ mod tests {
         crate::domains::fetch::handle(
             "enable", &json!({}), &mut ctx, &Some("second-raw".into()),
         ).await.unwrap();
-        let (resolver, _receiver) = tokio::sync::oneshot::channel();
-        let request = obscura_js::ops::InterceptedRequest {
-            request_id: "fetch-1".into(),
-            page_id: second.clone(),
-            body: b"cursor=next".to_vec(),
-            url: "https://example.test/graphql".into(),
-            method: "POST".into(),
-            headers: Default::default(),
-            resource_type: "Fetch".into(),
-            resolver,
+        let request = |request_id: &str| {
+            let (resolver, receiver) = tokio::sync::oneshot::channel();
+            (obscura_js::ops::InterceptedRequest {
+                request_id: request_id.into(),
+                page_id: second.clone(),
+                body: b"cursor=next".to_vec(),
+                url: "https://example.test/graphql".into(),
+                method: "POST".into(),
+                headers: Default::default(),
+                resource_type: "Fetch".into(),
+                resolver,
+            }, receiver)
         };
-        let expected_frame = ctx.get_page_mut(&second).unwrap().frame_id.clone();
-        assert_eq!(super::interception_route(&ctx, &request.page_id),
-            Some((expected_frame.as_str(), Some("second-raw".into()))));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        // The evaluating session must not take the request from its owner.
+        let (owned, _owned_resolution) = request("fetch-1");
+        super::emit_intercepted_request(owned, &ctx, None, &tx, &mut paused);
+        let mut sessions = std::collections::BTreeSet::new();
+        while let Ok(raw) = rx.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if event["method"] == "Fetch.requestPaused" {
+                sessions.insert(event["sessionId"].as_str().unwrap().to_string());
+                assert_eq!(event["params"]["request"]["postDataEntries"][0]["bytes"], "Y3Vyc29yPW5leHQ=");
+            }
+        }
+        assert_eq!(sessions, ["second-raw".to_string()].into());
+        assert!(paused.contains_key("fetch-1"));
+
         ctx.sessions.remove("second-raw");
-        assert!(super::interception_route(&ctx, &request.page_id).is_none(),
+        let (orphaned, orphaned_resolution) = request("fetch-2");
+        super::emit_intercepted_request(
+            orphaned, &ctx, Some((&second, "frame", Some("second-managed".into()))), &tx, &mut paused,
+        );
+        assert!(rx.try_recv().is_err(),
             "a detached subscriber must not redirect its request to another session");
+        assert!(matches!(orphaned_resolution.await,
+            Ok(obscura_js::ops::InterceptResolution::Fail { .. })));
         ctx.remove_page(&second);
         assert!(!ctx.fetch_intercept.sessions_by_page.contains_key(&second));
     }

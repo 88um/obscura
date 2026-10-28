@@ -23,7 +23,7 @@ shrank:
 | Request headers, `postData`, `postDataEntries` on script events | Still fork-only; added to upstream's `JsNetworkEvent` sites, using the request as finally sent after overrides and redirects |
 | Binary cached script response bodies | Still fork-only; upstream stores a lossy UTF-8 copy, the fork stores non-UTF-8 bodies base64 |
 | Exact POST bytes on `Fetch.requestPaused` | Still fork-only (`InterceptedRequest.body`) |
-| Paused requests go to the session that enabled Fetch | Still fork-only; tried before upstream's evaluating-session and first-attached-session fallbacks |
+| Paused requests go to the session that enabled Fetch | Still fork-only. Upstream's evaluating-session and first-attached-session fallbacks apply only to pages with no Fetch owner; a detached owner's requests fail instead of moving to another session |
 | `x-obscura-context` identity, `data:` frame scripts, ARM64/x86-64 stealth archives | Unchanged |
 
 Notable upstream changes for the apps: rustls 0.23.46 / rustls-webpki
