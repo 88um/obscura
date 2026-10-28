@@ -6,6 +6,40 @@ into the integration line formerly at `d09f871` (`v0.4.0-reposter-identity.6`).
 It retains shared history rather than rebasing published commits. The delta was
 310 commits, including 172 non-merge commits, since the common base `d9ef40b`.
 
+## 2026-10-27 sync (v0.6.0)
+
+Merges upstream `034a147514b319ff35216dec01998bf348c12190` into `v0.5.0` (`58ff5b9`): 412 commits, 204 of them
+non-merge, since the common base `1a3169d`. Shared history is retained again.
+
+Upstream now implements several fork contracts itself, so the fork delta
+shrank:
+
+| Contract | Resolution in this sync |
+| --- | --- |
+| Stable intercepted request IDs | Upstream allocates one `fetch-{N}` id before interception and uses it for `Fetch.requestPaused`, `Network.*` and the stored body. The fork's `{page}-intercept-{N}` ids are retired; no app parses either form |
+| Stealth fetch/XHR events and bodies | Upstream records both transports through `record_network_completion` with lazy streamed bodies. The fork's `scripted_response` module is removed |
+| Events delivered to every page attachment | Upstream fans runtime and interception events out to observer sessions |
+| `Fetch.enable` URL patterns | Upstream's matcher replaces the fork's |
+| Request headers, `postData`, `postDataEntries` on script events | Still fork-only; added to upstream's `JsNetworkEvent` sites, using the request as finally sent after overrides and redirects |
+| Binary cached script response bodies | Still fork-only; upstream stores a lossy UTF-8 copy, the fork stores non-UTF-8 bodies base64 |
+| Exact POST bytes on `Fetch.requestPaused` | Still fork-only (`InterceptedRequest.body`) |
+| Paused requests go to the session that enabled Fetch | Still fork-only; tried before upstream's evaluating-session and first-attached-session fallbacks |
+| `x-obscura-context` identity, `data:` frame scripts, ARM64/x86-64 stealth archives | Unchanged |
+
+Notable upstream changes for the apps: rustls 0.23.46 / rustls-webpki
+0.103.16 / Tokio 1.53.3 security updates; freed heap returned to the OS
+during long sessions; Web Storage persisted across navigation and IndexedDB
+backed; stricter cookie prefixes and `Expires` bounds; `Page.setBypassCSP`,
+`setContent` lifecycle and fragment-navigation fixes. Worker recycling
+(`serve` by connections, RSS or age) is opt-in and not needed by the
+one-process-per-connection supervisors.
+
+Both apps' supervisors already run each child as
+`serve --host 127.0.0.1 --workers 1 [--stealth]`, refuse `Origin` and rewrite
+`Host` to loopback, so no deployment change is required beyond the pin.
+Storage persistence and cookie strictness change observable browser state;
+qualify live login and collection before relying on the new pin.
+
 ## Contracts retained
 
 | Contract | Why the apps need it | Resolution |

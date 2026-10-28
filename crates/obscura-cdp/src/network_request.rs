@@ -32,6 +32,8 @@ mod tests {
     fn playwright_post_entries_preserve_binary_upload_bytes() {
         let event = NetworkEvent {
             request_id: "fetch-1".into(),
+            intercepted: false,
+            error_text: None,
             url: "https://example.test/upload".into(),
             method: "POST".into(),
             headers: Default::default(),

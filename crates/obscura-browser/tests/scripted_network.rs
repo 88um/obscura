@@ -67,7 +67,7 @@ async fn scripted_responses_are_observable(stealth: bool) {
             }
             let body = page.get_response_body(&event.request_id).expect("CDP response body");
             assert!(!body.base64_encoded);
-            assert_eq!(body.body, format!(r#"{{"transport":"{transport}"}}"#));
+            assert_eq!(body.body, format!(r#"{{"transport":"{transport}"}}"#).into_bytes());
         }
         assert_ne!(page.network_events[0].request_id, page.network_events[1].request_id);
         page.network_events.clear();
